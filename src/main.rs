@@ -41,9 +41,27 @@ fn file_md5(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Result<bool> {
-    let mmc_pack_path = Path::new(inst_dir).join("mmc-pack.json");
-    let contents = fs::read_to_string(&mmc_pack_path)?;
+fn read_neoforge_version(mmc_pack_path: &Path) -> anyhow::Result<String> {
+    let contents = fs::read_to_string(mmc_pack_path)?;
+    let mmc_pack: serde_json::Value = serde_json::from_str(&contents)?;
+
+    let version = mmc_pack
+        .get("components")
+        .and_then(|c| c.as_array())
+        .and_then(|components| {
+            components
+                .iter()
+                .find(|c| c.get("uid").and_then(|u| u.as_str()) == Some("net.neoforged"))
+        })
+        .and_then(|c| c.get("version"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("NeoForge component not found in mmc-pack.json"))?;
+
+    Ok(version.to_string())
+}
+
+fn write_neoforge_version(mmc_pack_path: &Path, remote_version: &str) -> anyhow::Result<()> {
+    let contents = fs::read_to_string(mmc_pack_path)?;
     let mut mmc_pack: serde_json::Value = serde_json::from_str(&contents)?;
 
     let components = mmc_pack
@@ -56,18 +74,45 @@ fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Resu
         .find(|c| c.get("uid").and_then(|u| u.as_str()) == Some("net.neoforged"))
         .ok_or_else(|| anyhow::anyhow!("NeoForge component not found in mmc-pack.json"))?;
 
-    let local_version = neoforge.get("version").and_then(|v| v.as_str()).unwrap_or("");
-
-    if local_version == remote_version {
-        return Ok(false);
-    }
-
     neoforge["version"] = serde_json::Value::String(remote_version.to_string());
     neoforge["cachedVersion"] = serde_json::Value::String(remote_version.to_string());
 
-    fs::write(&mmc_pack_path, serde_json::to_string_pretty(&mmc_pack)?)?;
+    fs::write(mmc_pack_path, serde_json::to_string_pretty(&mmc_pack)?)?;
 
-    Ok(true)
+    Ok(())
+}
+
+// PrismLauncher can rewrite mmc-pack.json from its own in-memory component state while an
+// instance is open, silently clobbering an external edit. Verify the write actually stuck
+// and retry; if it never sticks, fail loudly instead of proceeding with a mismatched loader.
+fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Result<bool> {
+    let mmc_pack_path = Path::new(inst_dir).join("mmc-pack.json");
+
+    if read_neoforge_version(&mmc_pack_path)? == remote_version {
+        return Ok(false);
+    }
+
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        write_neoforge_version(&mmc_pack_path, remote_version)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        if read_neoforge_version(&mmc_pack_path)? == remote_version {
+            return Ok(true);
+        }
+
+        println!(
+            "NeoForge version write did not stick (attempt {}/{}), retrying...",
+            attempt, MAX_ATTEMPTS
+        );
+    }
+
+    anyhow::bail!(
+        "Failed to persist NeoForge version {} into mmc-pack.json after {} attempts. \
+         Close PrismLauncher (it overwrites this file while the instance is open) and retry.",
+        remote_version,
+        MAX_ATTEMPTS
+    )
 }
 
 fn main() -> anyhow::Result<()> {
