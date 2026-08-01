@@ -3,6 +3,7 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use md5::{Digest, Md5};
+use rayon::prelude::*;
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -31,35 +32,50 @@ fn mmc_pack_path() -> PathBuf {
 
 fn zip_mods() -> anyhow::Result<()> {
     let mods_dir = workdir().join("mods");
+
+    let entries: Vec<_> = walkdir::WalkDir::new(&mods_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let rel_path = match e.path().strip_prefix(&mods_dir) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+
+            if rel_path.as_os_str().is_empty() {
+                return false;
+            }
+
+            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+            !(rel_str.contains(".connector") || rel_str.split('/').any(|p| p == "server"))
+        })
+        .collect();
+
+    let files: Vec<(String, bool, Vec<u8>)> = entries
+        .par_iter()
+        .map(|entry| -> anyhow::Result<(String, bool, Vec<u8>)> {
+            let path = entry.path();
+            let rel_str = path
+                .strip_prefix(&mods_dir)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let is_dir = path.is_dir();
+            let data = if is_dir { Vec::new() } else { fs::read(path)? };
+
+            Ok((rel_str, is_dir, data))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
     let zip_file = fs::File::create(output_zip_path())?;
     let mut writer = zip::ZipWriter::new(zip_file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    for entry in walkdir::WalkDir::new(&mods_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        let rel_path = path.strip_prefix(&mods_dir)?;
-
-        if rel_path.as_os_str().is_empty() {
-            continue;
-        }
-
-        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-
-        if rel_str.contains(".connector") || rel_str.split('/').any(|p| p == "server") {
-            continue;
-        }
-
-        if path.is_dir() {
+    for (rel_str, is_dir, data) in files {
+        if is_dir {
             writer.add_directory(format!("{}/", rel_str), options)?;
         } else {
             writer.start_file(rel_str, options)?;
-            let mut file = fs::File::open(path)?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)?;
-            std::io::Write::write_all(&mut writer, &buffer)?;
+            std::io::Write::write_all(&mut writer, &data)?;
         }
     }
 
