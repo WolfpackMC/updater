@@ -49,3 +49,40 @@ jobs:
           target/release/deploy
           target/release/deploy.exe
         if-no-files-found: ignore
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download Windows mcupdater artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: mcupdater-windows
+        path: dist
+
+    - name: Download Linux mcupdater artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: mcupdater-linux
+        path: dist
+
+    - name: Rename release assets
+      run: |
+        mv dist/mcupdater.exe dist/mcupdater-windows.exe
+        mv dist/mcupdater dist/mcupdater-linux
+        chmod +x dist/mcupdater-linux
+
+    - name: Publish rolling latest release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: latest
+        name: Latest build
+        prerelease: true
+        body: Automatically updated build from the latest main branch commit.
+        files: |
+          dist/mcupdater-windows.exe
+          dist/mcupdater-linux

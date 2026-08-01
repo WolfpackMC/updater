@@ -82,9 +82,11 @@ fn write_neoforge_version(mmc_pack_path: &Path, remote_version: &str) -> anyhow:
     Ok(())
 }
 
-// PrismLauncher can rewrite mmc-pack.json from its own in-memory component state while an
-// instance is open, silently clobbering an external edit. Verify the write actually stuck
-// and retry; if it never sticks, fail loudly instead of proceeding with a mismatched loader.
+// PrismLauncher can rewrite mmc-pack.json from its own in-memory component state, silently
+// clobbering an external edit — this can happen well after the pre-launch command exits, so
+// checking for the process isn't a valid gate (Prism is always running; it's the parent).
+// Verify the write actually stuck and retry; if it never sticks, fail loudly instead of
+// proceeding with a mismatched loader.
 fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Result<bool> {
     let mmc_pack_path = Path::new(inst_dir).join("mmc-pack.json");
 
@@ -95,7 +97,7 @@ fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Resu
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         write_neoforge_version(&mmc_pack_path, remote_version)?;
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
         if read_neoforge_version(&mmc_pack_path)? == remote_version {
             return Ok(true);
@@ -109,7 +111,9 @@ fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Resu
 
     anyhow::bail!(
         "Failed to persist NeoForge version {} into mmc-pack.json after {} attempts. \
-         Close PrismLauncher (it overwrites this file while the instance is open) and retry.",
+         PrismLauncher is likely re-saving the file from a stale in-memory copy of this \
+         instance's component list — fully restart PrismLauncher (not just this instance) \
+         and retry.",
         remote_version,
         MAX_ATTEMPTS
     )
