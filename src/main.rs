@@ -28,6 +28,35 @@ fn move_dir_fallback(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Result<bool> {
+    let mmc_pack_path = Path::new(inst_dir).join("mmc-pack.json");
+    let contents = fs::read_to_string(&mmc_pack_path)?;
+    let mut mmc_pack: serde_json::Value = serde_json::from_str(&contents)?;
+
+    let components = mmc_pack
+        .get_mut("components")
+        .and_then(|c| c.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("mmc-pack.json missing components array"))?;
+
+    let neoforge = components
+        .iter_mut()
+        .find(|c| c.get("uid").and_then(|u| u.as_str()) == Some("net.neoforged"))
+        .ok_or_else(|| anyhow::anyhow!("NeoForge component not found in mmc-pack.json"))?;
+
+    let local_version = neoforge.get("version").and_then(|v| v.as_str()).unwrap_or("");
+
+    if local_version == remote_version {
+        return Ok(false);
+    }
+
+    neoforge["version"] = serde_json::Value::String(remote_version.to_string());
+    neoforge["cachedVersion"] = serde_json::Value::String(remote_version.to_string());
+
+    fs::write(&mmc_pack_path, serde_json::to_string_pretty(&mmc_pack)?)?;
+
+    Ok(true)
+}
+
 fn files_are_identical(path1: &Path, path2: &Path) -> io::Result<bool> {
     let meta1 = fs::metadata(path1)?;
     let meta2 = fs::metadata(path2)?;
@@ -85,6 +114,21 @@ fn main() -> anyhow::Result<()> {
     if local_version >= remote_version && local_version != 0 {
         println!("You are on the latest version. Skipping update.");
         return Ok(());
+    }
+
+    println!("Checking NeoForge version...");
+    let neoforge_res = client.get(format!("{}/neoforge-version", S3_URL)).send()?;
+
+    if neoforge_res.status().is_success() {
+        let remote_neoforge_version = neoforge_res.text()?.trim().to_string();
+
+        if update_neoforge_version(&inst_dir, &remote_neoforge_version)? {
+            println!("Updated NeoForge to version {}", remote_neoforge_version);
+        } else {
+            println!("NeoForge is already up to date.");
+        }
+    } else {
+        println!("No NeoForge version published. Skipping NeoForge check.");
     }
 
     let zip_path = Path::new(&inst_dir).join("WFP.zip");
