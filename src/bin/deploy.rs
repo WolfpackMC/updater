@@ -4,13 +4,20 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use md5::{Digest, Md5};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use zip::write::SimpleFileOptions;
 
 const BUCKET: &str = "wolfpackmc";
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct ModEntry {
+    name: String,
+    hash: String,
+    profiles: Vec<String>,
+}
 
 fn workdir() -> PathBuf {
     PathBuf::from("E:\\PrismLauncher\\instances\\server\\minecraft")
@@ -20,67 +27,59 @@ fn instance_dir() -> PathBuf {
     workdir().parent().unwrap().to_path_buf()
 }
 
-fn output_zip_path() -> PathBuf {
-    workdir().join("WFP.zip")
-}
-
 fn mmc_pack_path() -> PathBuf {
     instance_dir().join("mmc-pack.json")
 }
 
-/* ---------------- ZIP ---------------- */
+fn profile_exclude_path() -> PathBuf {
+    workdir().join("profile-exclude.json")
+}
 
-fn zip_mods() -> anyhow::Result<()> {
+/// Substrings matched against mod filenames; a match excludes that mod from the "minimal" profile.
+fn load_minimal_excludes() -> anyhow::Result<Vec<String>> {
+    match fs::read_to_string(profile_exclude_path()) {
+        Ok(contents) => Ok(serde_json::from_str(&contents)?),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/* ---------------- MOD SCAN ---------------- */
+
+fn collect_mods() -> Vec<(String, PathBuf)> {
     let mods_dir = workdir().join("mods");
 
-    let entries: Vec<_> = walkdir::WalkDir::new(&mods_dir)
+    walkdir::WalkDir::new(&mods_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            let rel_path = match e.path().strip_prefix(&mods_dir) {
-                Ok(p) => p,
-                Err(_) => return false,
-            };
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            let rel_path = e.path().strip_prefix(&mods_dir).ok()?;
+            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
-            if rel_path.as_os_str().is_empty() {
-                return false;
+            if rel_str.contains(".connector") || rel_str.split('/').any(|p| p == "server") {
+                return None;
             }
 
-            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-            !(rel_str.contains(".connector") || rel_str.split('/').any(|p| p == "server"))
+            Some((rel_str, e.into_path()))
         })
-        .collect();
+        .collect()
+}
 
-    let files: Vec<(String, bool, Vec<u8>)> = entries
-        .par_iter()
-        .map(|entry| -> anyhow::Result<(String, bool, Vec<u8>)> {
-            let path = entry.path();
-            let rel_str = path
-                .strip_prefix(&mods_dir)?
-                .to_string_lossy()
-                .replace('\\', "/");
-            let is_dir = path.is_dir();
-            let data = if is_dir { Vec::new() } else { fs::read(path)? };
+fn build_manifest(mods: &[(String, PathBuf)], minimal_excludes: &[String]) -> anyhow::Result<Vec<ModEntry>> {
+    mods.par_iter()
+        .map(|(name, path)| -> anyhow::Result<ModEntry> {
+            let mut profiles = vec!["all".to_string()];
+            if !minimal_excludes.iter().any(|ex| name.contains(ex.as_str())) {
+                profiles.push("minimal".to_string());
+            }
 
-            Ok((rel_str, is_dir, data))
+            Ok(ModEntry {
+                name: name.clone(),
+                hash: get_file_md5(path)?,
+                profiles,
+            })
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let zip_file = fs::File::create(output_zip_path())?;
-    let mut writer = zip::ZipWriter::new(zip_file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-
-    for (rel_str, is_dir, data) in files {
-        if is_dir {
-            writer.add_directory(format!("{}/", rel_str), options)?;
-        } else {
-            writer.start_file(rel_str, options)?;
-            std::io::Write::write_all(&mut writer, &data)?;
-        }
-    }
-
-    writer.finish()?;
-    Ok(())
+        .collect()
 }
 
 /* ---------------- HASH ---------------- */
@@ -133,10 +132,6 @@ async fn put_object_text(client: &Client, key: &str, body: String, content_type:
     Ok(())
 }
 
-async fn get_remote_hash(client: &Client) -> anyhow::Result<Option<String>> {
-    get_object_text(client, "WFP.hash").await
-}
-
 async fn get_version(client: &Client) -> anyhow::Result<u32> {
     Ok(get_object_text(client, "version")
         .await?
@@ -144,22 +139,45 @@ async fn get_version(client: &Client) -> anyhow::Result<u32> {
         .unwrap_or(0))
 }
 
-async fn upload_zip(client: &Client) -> anyhow::Result<()> {
-    let bytes = fs::read(output_zip_path())?;
+async fn get_remote_manifest(client: &Client) -> anyhow::Result<Option<Vec<ModEntry>>> {
+    match get_object_text(client, "manifest.json").await? {
+        // an old-schema or malformed manifest is treated as absent, forcing a full republish
+        Some(text) => Ok(serde_json::from_str(&text).ok()),
+        None => Ok(None),
+    }
+}
+
+async fn upload_manifest(client: &Client, manifest: &[ModEntry]) -> anyhow::Result<()> {
+    let body = serde_json::to_string(manifest)?;
+    put_object_text(client, "manifest.json", body, "application/json").await
+}
+
+async fn mod_blob_exists(client: &Client, hash: &str) -> anyhow::Result<bool> {
+    match client
+        .head_object()
+        .bucket(BUCKET)
+        .key(format!("mods/{}.jar", hash))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(SdkError::ServiceError(ctx)) if ctx.raw().status().as_u16() == 404 => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn upload_mod_blob(client: &Client, hash: &str, path: &Path) -> anyhow::Result<()> {
+    let bytes = fs::read(path)?;
     client
         .put_object()
         .bucket(BUCKET)
-        .key("WFP.zip")
+        .key(format!("mods/{}.jar", hash))
         .body(ByteStream::from(bytes))
         .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
-        .content_type("application/zip")
+        .content_type("application/java-archive")
         .send()
         .await?;
     Ok(())
-}
-
-async fn upload_hash(client: &Client, hash: &str) -> anyhow::Result<()> {
-    put_object_text(client, "WFP.hash", hash.to_string(), "text/plain").await
 }
 
 async fn upload_version(client: &Client, version: u32) -> anyhow::Result<()> {
@@ -217,17 +235,19 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::from_conf(config);
 
-    println!("Zipping...");
-    zip_mods()?;
+    println!("Scanning mods...");
+    let mods = collect_mods();
+    let minimal_excludes = load_minimal_excludes()?;
 
-    println!("Hashing...");
-    let local_hash = get_file_md5(&output_zip_path())?;
+    println!("Hashing mods...");
+    let mut manifest = build_manifest(&mods, &minimal_excludes)?;
+    manifest.sort_by(|a, b| a.name.cmp(&b.name));
 
-    println!("Fetching remote hash...");
-    let remote_hash = get_remote_hash(&client).await?;
+    println!("Fetching remote manifest...");
+    let mut remote_manifest = get_remote_manifest(&client).await?.unwrap_or_default();
+    remote_manifest.sort_by(|a, b| a.name.cmp(&b.name));
 
-    println!("Local: {}", local_hash);
-    println!("Remote: {:?}", remote_hash);
+    let mods_changed = manifest != remote_manifest;
 
     println!("Checking NeoForge version...");
     let local_neoforge_version = get_local_neoforge_version()?;
@@ -236,7 +256,6 @@ async fn main() -> anyhow::Result<()> {
     println!("Local NeoForge: {}", local_neoforge_version);
     println!("Remote NeoForge: {:?}", remote_neoforge_version);
 
-    let mods_changed = Some(local_hash.clone()) != remote_hash;
     let neoforge_changed = Some(local_neoforge_version.clone()) != remote_neoforge_version;
 
     if !mods_changed && !neoforge_changed {
@@ -247,8 +266,14 @@ async fn main() -> anyhow::Result<()> {
     println!("Changes detected. Uploading...");
 
     if mods_changed {
-        upload_zip(&client).await?;
-        upload_hash(&client, &local_hash).await?;
+        for (name, path) in &mods {
+            let entry = manifest.iter().find(|m| &m.name == name).unwrap();
+            if !mod_blob_exists(&client, &entry.hash).await? {
+                println!("Uploading {}", name);
+                upload_mod_blob(&client, &entry.hash, path).await?;
+            }
+        }
+        upload_manifest(&client, &manifest).await?;
     }
 
     if neoforge_changed {

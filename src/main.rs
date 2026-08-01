@@ -1,31 +1,44 @@
+use md5::{Digest, Md5};
+use std::collections::HashMap;
 use std::{env, fs, io};
 use std::fs::{rename, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CDN_URL: &str = "https://wolfpack-cdn.kalkafox.dev";
 const S3_URL: &str = "https://wolfpackmc.s3.us-east-1.amazonaws.com";
 
-const PROGRESS_INTERVAL: u64 = 10 * 1024 * 1024;
+#[derive(serde::Deserialize)]
+struct ModEntry {
+    name: String,
+    hash: String,
+    profiles: Vec<String>,
+}
 
-fn move_dir_fallback(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
+fn parse_profile_arg() -> String {
+    let args: Vec<String> = env::args().collect();
+    args.iter()
+        .position(|a| a == "--profile")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "all".to_string())
+}
 
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let target = dst.join(entry.file_name());
+fn file_md5(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Md5::new();
+    let mut buffer = [0u8; 8192];
 
-        if path.is_dir() {
-            move_dir_fallback(&path, &target)?;
-        } else {
-            fs::copy(&path, &target)?;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
         }
+        hasher.update(&buffer[..n]);
     }
 
-    fs::remove_dir_all(src)?;
-    Ok(())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Result<bool> {
@@ -57,36 +70,10 @@ fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Resu
     Ok(true)
 }
 
-fn files_are_identical(path1: &Path, path2: &Path) -> io::Result<bool> {
-    let meta1 = fs::metadata(path1)?;
-    let meta2 = fs::metadata(path2)?;
-
-    if meta1.len() != meta2.len() {
-        return Ok(false);
-    }
-
-    let mut f1 = File::open(path1)?;
-    let mut f2 = File::open(path2)?;
-
-    let mut buffer1 = [0; 8192];
-    let mut buffer2 = [0; 8192];
-
-    loop {
-        let n1 = f1.read(&mut buffer1)?;
-        let n2 = f2.read(&mut buffer2)?;
-
-        if n1 != n2 || buffer1[..n1] != buffer2[..n2] {
-            return Ok(false);
-        }
-        if n1 == 0 {
-            break;
-        }
-    }
-
-    Ok(true)
-}
-
 fn main() -> anyhow::Result<()> {
+    let profile = parse_profile_arg();
+    println!("Using profile: {}", profile);
+
     let inst_name = env::var("INST_NAME").unwrap_or_default();
     let inst_id = env::var("INST_ID").unwrap_or_default();
     let inst_dir = env::var("INST_DIR").unwrap_or_default();
@@ -131,153 +118,97 @@ fn main() -> anyhow::Result<()> {
         println!("No NeoForge version published. Skipping NeoForge check.");
     }
 
-    let zip_path = Path::new(&inst_dir).join("WFP.zip");
-    println!("Starting download of WFP.zip...");
+    println!("Fetching mod manifest...");
+    let full_manifest: Vec<ModEntry> = client
+        .get(format!("{}/manifest.json", S3_URL))
+        .send()?
+        .json()?;
 
-    let mut response = client.get(format!("{}/WFP.zip", S3_URL)).send()?;
-
-    let total_size = response.content_length().unwrap_or(0);
-
-    let mut out_file = File::create(&zip_path)?;
-
-    let mut downloaded: u64 = 0;
-    let mut last_reported: u64 = 0;
-    let mut buffer = [0; 8192];
-
-    let start_time = Instant::now();
-    let mut last_time = start_time;
-    let mut last_bytes = 0u64;
-
-    loop {
-        let bytes_read = response.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        out_file.write_all(&buffer[..bytes_read])?;
-        downloaded += bytes_read as u64;
-
-        let now = Instant::now();
-        let elapsed = now.duration_since(last_time).as_secs_f64();
-
-        if downloaded - last_reported >= PROGRESS_INTERVAL || downloaded == total_size {
-            let percentage = if total_size > 0 {
-                (downloaded as f64 / total_size as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            let bytes_since_last = downloaded - last_bytes;
-            let speed = bytes_since_last as f64 / elapsed; // bytes/sec
-
-            println!(
-                "Progress: {:.2} MB / {:.2} MB ({:.1}%) | Speed: {:.2} MB/s",
-                downloaded as f64 / 1_048_576.0,
-                total_size as f64 / 1_048_576.0,
-                percentage,
-                speed / 1_048_576.0
-            );
-
-            last_reported = downloaded;
-            last_bytes = downloaded;
-            last_time = now;
-        }
-    }
-
-    println!("Download complete!");
-
-    // Setup a staging directory to extract the remote zip into
-    let mods_staging = Path::new(&inst_mc_dir).join(".mods_staging");
-    if mods_staging.exists() {
-        fs::remove_dir_all(&mods_staging)?;
-    }
-    fs::create_dir_all(&mods_staging)?;
-
-    println!("Extracting jar files into staging folder...");
-    let zip_file = File::open(&zip_path)?;
-    let mut archive = zip::ZipArchive::new(zip_file)?;
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-
-        let outpath = match file.enclosed_name() {
-            Some(path) => path.to_owned(),
-            None => continue,
-        };
-
-        let extract_path = mods_staging.join(&outpath);
-
-        if (*file.name()).ends_with('/') {
-            fs::create_dir_all(&extract_path)?;
-        } else {
-            if let Some(p) = extract_path.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p)?;
-                }
-            }
-            let mut outfile = File::create(&extract_path)?;
-            io::copy(&mut file, &mut outfile)?;
-        }
-    }
+    let manifest: Vec<ModEntry> = full_manifest
+        .into_iter()
+        .filter(|m| m.profiles.iter().any(|p| p == &profile))
+        .collect();
 
     let mods_dir = Path::new(&inst_mc_dir).join("mods");
+    fs::create_dir_all(&mods_dir)?;
+
+    println!("Hashing local mods...");
+    // keyed by base name (Prism's ".disabled" suffix stripped), so a disabled mod still
+    // matches its manifest entry instead of being treated as missing/stale.
+    let mut local_hashes: HashMap<String, (String, bool)> = HashMap::new();
+    for entry in walkdir::WalkDir::new(&mods_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+    {
+        let rel = entry
+            .path()
+            .strip_prefix(&mods_dir)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let disabled = rel.ends_with(".disabled");
+        let base = rel.strip_suffix(".disabled").unwrap_or(&rel).to_string();
+        local_hashes.insert(base, (file_md5(entry.path())?, disabled));
+    }
+
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let backup_dir = Path::new(&inst_mc_dir).join(format!("mods_backup_{}", timestamp));
     let mut backup_created = false;
 
-    println!("Comparing existing mods with the remote update...");
+    println!("Backing up outdated and removed mods...");
+    for (base_name, (local_hash, disabled)) in &local_hashes {
+        let up_to_date = manifest
+            .iter()
+            .any(|m| &m.name == base_name && &m.hash == local_hash);
 
-    if mods_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&mods_dir) {
-            for entry in entries.flatten() {
-                let current_mod_path = entry.path();
-
-                if current_mod_path.is_file() {
-                    let file_name = current_mod_path.file_name().unwrap();
-                    let staging_mod_path = mods_staging.join(file_name);
-
-                    let mut should_backup = true;
-
-                    if staging_mod_path.exists() {
-                        if let Ok(true) = files_are_identical(&current_mod_path, &staging_mod_path) {
-                            should_backup = false;
-                        }
-                    }
-
-                    if should_backup {
-                        if !backup_created {
-                            fs::create_dir_all(&backup_dir)?;
-                            backup_created = true;
-                        }
-                        let backup_file_path = backup_dir.join(file_name);
-                        rename(&current_mod_path, &backup_file_path)?;
-                    } else {
-                        let _ = fs::remove_file(&staging_mod_path);
-                    }
-                }
+        if !up_to_date {
+            if !backup_created {
+                fs::create_dir_all(&backup_dir)?;
+                backup_created = true;
             }
-        }
-    } else {
-        fs::create_dir_all(&mods_dir)?;
-    }
-
-    println!("Applying new mods...");
-    if let Ok(entries) = fs::read_dir(&mods_staging) {
-        for entry in entries.flatten() {
-            let staging_path = entry.path();
-            let target_path = mods_dir.join(entry.file_name());
-
-            if staging_path.is_dir() {
-                move_dir_fallback(&staging_path, &target_path)?;
+            let on_disk_name = if *disabled {
+                format!("{}.disabled", base_name)
             } else {
-                rename(&staging_path, &target_path)?;
+                base_name.clone()
+            };
+            let src = mods_dir.join(&on_disk_name);
+            let dst = backup_dir.join(&on_disk_name);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
             }
+            rename(&src, &dst)?;
         }
     }
 
-    println!("Cleaning up temporary files...");
-    fs::remove_dir_all(&mods_staging)?;
-    fs::remove_file(&zip_path)?;
+    println!("Downloading new and updated mods...");
+    for entry in &manifest {
+        let local = local_hashes.get(&entry.name);
+        let up_to_date = local.map(|(h, _)| h == &entry.hash).unwrap_or(false);
+
+        if up_to_date {
+            continue;
+        }
+
+        // preserve disabled state across an update instead of silently re-enabling the mod
+        let disabled = local.map(|(_, d)| *d).unwrap_or(false);
+        let on_disk_name = if disabled {
+            format!("{}.disabled", entry.name)
+        } else {
+            entry.name.clone()
+        };
+
+        println!("Downloading {}...", entry.name);
+        let target_path = mods_dir.join(&on_disk_name);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut response = client
+            .get(format!("{}/mods/{}.jar", S3_URL, entry.hash))
+            .send()?;
+        let mut out_file = File::create(&target_path)?;
+        io::copy(&mut response, &mut out_file)?;
+    }
 
     println!("Updating local version file...");
     fs::write(&version_path, remote_version.to_string())?;
