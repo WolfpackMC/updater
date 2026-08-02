@@ -11,6 +11,8 @@ Self-updating mod sync + S3 publishing tool pair for the Wolfpack NeoForge modpa
 
 `mcupdater` runs inside a PrismLauncher instance and keeps a player's local mod set in sync with a modpack published on S3/CDN — checking version, updating NeoForge, downloading and diffing the mod archive, and applying only what changed. `deploy` is the companion tool the pack maintainer runs locally to zip, hash, and publish a new mod set to S3.
 
+Both read/write through CloudFront (`wolfpack-cdn.kalkafox.dev`) rather than hitting the `wolfpackmc` S3 bucket directly, for regional download speed. Content-addressed objects (`mods/{hash}.jar`) are cached for a year (immutable — the hash guarantees the content never changes at that key). Mutable pointers (`version`, `neoforge-version`, `manifest.json`, `packs.json`, the `.mrpack`) are cached for only 60 seconds, so a publish is visible everywhere within a minute without needing an explicit CloudFront invalidation.
+
 ## Why
 
 Manually distributing modpack updates (mod adds/removes/version bumps, NeoForge version bumps) to a set of players is error-prone and wastes bandwidth re-downloading unchanged mods. This tool pair automates both ends: a one-shot diffing updater for players, and a change-detecting publisher for the maintainer.
@@ -64,9 +66,13 @@ if local_version >= remote_version && local_version != 0 {
 
 ```bash
 ./target/release/deploy
+./target/release/deploy --force   # republish even if nothing changed (also (re)builds the mrpack + packs.json)
+./target/release/deploy --server  # publish the dedicated-server mod set instead (skips mrpack/packs.json)
 ```
 
 Zips the local mods folder, hashes it, compares against remote S3 state, and uploads only on change, bumping the remote version.
+
+On any client-side publish that changes mods or the NeoForge version, `deploy` also builds and uploads a `.mrpack` (every mod listed in `files[]` pointing at the same `mods/{hash}.jar` blobs it just published, no Modrinth lookups needed) and updates `packs.json` at the bucket root — the manifest PrismLauncher's "Wolfpack" new-instance page reads to list installable packs. Only a fixed allowlist of top-level dirs (`config/`, `icon.png`, `options.txt`, `servers.dat`) is included as overrides; everything else under the instance's minecraft dir (saves, screenshots, logs, per-player caches, stray zips, etc.) is deliberately left out. Server publishes (`--server`) skip mrpack/packs.json entirely, since there's no from-scratch instance-creation flow for the server side.
 
 ## Configuration
 

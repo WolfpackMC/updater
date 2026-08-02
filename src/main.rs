@@ -7,7 +7,6 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CDN_URL: &str = "https://wolfpack-cdn.kalkafox.dev";
-const S3_URL: &str = "https://wolfpackmc.s3.us-east-1.amazonaws.com";
 
 #[derive(serde::Deserialize)]
 struct ModEntry {
@@ -163,6 +162,7 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(cwd);
 
     let version_path = Path::new(&inst_dir).join("version");
+    let profile_path = Path::new(&inst_dir).join("profile");
 
     println!("Checking local version...");
     let local_version: u32 = match fs::read_to_string(&version_path) {
@@ -171,22 +171,30 @@ fn main() -> anyhow::Result<()> {
     };
     println!("Local version: {}", local_version);
 
+    let local_profile = fs::read_to_string(&profile_path).ok().map(|p| p.trim().to_string());
+    println!("Local profile: {:?}", local_profile);
+
     println!("Checking remote version...");
     let client = reqwest::blocking::Client::builder().build()?;
 
-    let res = client.get(format!("{}/{}/version", S3_URL, prefix)).send()?;
+    let res = client.get(format!("{}/{}/version", CDN_URL, prefix)).send()?;
     let remote_version_str = res.text()?;
     let remote_version: u32 = remote_version_str.trim().parse().unwrap_or(0);
     println!("Remote version: {}", remote_version);
 
-    if local_version >= remote_version && local_version != 0 {
-        println!("You are on the latest version. Skipping update.");
+    // A version match alone doesn't mean nothing to do — switching --profile (e.g. all ->
+    // minimal) needs mods excluded from the new profile removed even if the remote manifest
+    // itself hasn't changed. Only skip when both the version AND the profile used for the
+    // last successful sync match.
+    let profile_unchanged = local_profile.as_deref() == Some(profile.as_str());
+    if local_version >= remote_version && local_version != 0 && profile_unchanged {
+        println!("You are on the latest version and profile. Skipping update.");
         return Ok(());
     }
 
     println!("Checking NeoForge version...");
     let neoforge_res = client
-        .get(format!("{}/{}/neoforge-version", S3_URL, prefix))
+        .get(format!("{}/{}/neoforge-version", CDN_URL, prefix))
         .send()?;
 
     if neoforge_res.status().is_success() {
@@ -212,7 +220,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Fetching mod manifest...");
     let full_manifest: Vec<ModEntry> = client
-        .get(format!("{}/{}/manifest.json", S3_URL, prefix))
+        .get(format!("{}/{}/manifest.json", CDN_URL, prefix))
         .send()?
         .json()?;
 
@@ -296,7 +304,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         let mut response = client
-            .get(format!("{}/mods/{}.jar", S3_URL, entry.hash))
+            .get(format!("{}/mods/{}.jar", CDN_URL, entry.hash))
             .send()?;
         let mut out_file = File::create(&target_path)?;
         io::copy(&mut response, &mut out_file)?;
@@ -304,6 +312,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Updating local version file...");
     fs::write(&version_path, remote_version.to_string())?;
+    fs::write(&profile_path, &profile)?;
 
     println!("Successfully updated modpack to version {}!", remote_version);
 

@@ -5,12 +5,20 @@ use aws_sdk_s3::Client;
 use md5::{Digest, Md5};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+use sha2::Sha512;
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const BUCKET: &str = "wolfpackmc";
+const CDN_URL: &str = "https://wolfpack-cdn.kalkafox.dev";
+/// Mutable keys (version pointers, manifests, the mrpack) get a short TTL so CloudFront
+/// doesn't serve stale state for long after a publish. Content-addressed keys
+/// (mods/{hash}.jar) are cached far longer since their content never changes once uploaded.
+const MUTABLE_CACHE_CONTROL: &str = "public, max-age=60";
+const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 struct ModEntry {
@@ -68,7 +76,7 @@ fn load_minimal_excludes(paths: &ModpackPaths) -> anyhow::Result<Vec<String>> {
 
 /* ---------------- MOD SCAN ---------------- */
 
-fn collect_mods(paths: &ModpackPaths) -> Vec<(String, PathBuf)> {
+fn collect_mods(paths: &ModpackPaths, server: bool) -> Vec<(String, PathBuf)> {
     let mods_dir = paths.workdir.join("mods");
 
     walkdir::WalkDir::new(&mods_dir)
@@ -82,6 +90,7 @@ fn collect_mods(paths: &ModpackPaths) -> Vec<(String, PathBuf)> {
             if rel_str.contains(".connector")
                 || rel_str.split('/').any(|p| p == "server")
                 || rel_str.ends_with(".zip")
+                || (server && rel_str.contains(".client"))
             {
                 return None;
             }
@@ -126,6 +135,222 @@ fn get_file_md5(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn get_file_sha1_sha512(path: &Path) -> anyhow::Result<(String, String)> {
+    let bytes = fs::read(path)?;
+
+    let mut sha1_hasher = Sha1::new();
+    sha1_hasher.update(&bytes);
+    let sha1 = format!("{:x}", sha1_hasher.finalize());
+
+    let mut sha512_hasher = Sha512::new();
+    sha512_hasher.update(&bytes);
+    let sha512 = format!("{:x}", sha512_hasher.finalize());
+
+    Ok((sha1, sha512))
+}
+
+/* ---------------- MRPACK ---------------- */
+
+#[derive(Serialize)]
+struct MrpackHashes {
+    sha1: String,
+    sha512: String,
+}
+
+#[derive(Serialize)]
+struct MrpackEnv {
+    client: String,
+    server: String,
+}
+
+#[derive(Serialize)]
+struct MrpackFile {
+    path: String,
+    hashes: MrpackHashes,
+    env: MrpackEnv,
+    downloads: Vec<String>,
+    #[serde(rename = "fileSize")]
+    file_size: u64,
+}
+
+#[derive(Serialize)]
+struct MrpackDependencies {
+    minecraft: String,
+    neoforge: String,
+}
+
+#[derive(Serialize)]
+struct MrpackIndex {
+    #[serde(rename = "formatVersion")]
+    format_version: u32,
+    game: String,
+    #[serde(rename = "versionId")]
+    version_id: String,
+    name: String,
+    summary: String,
+    files: Vec<MrpackFile>,
+    dependencies: MrpackDependencies,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PackEntry {
+    id: String,
+    name: String,
+    description: String,
+    #[serde(rename = "mrpackUrl")]
+    mrpack_url: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PacksManifest {
+    packs: Vec<PackEntry>,
+}
+
+/// Top-level entries under the instance's minecraft dir that are safe to redistribute.
+/// Everything else (saves, screenshots, logs, per-player caches, stray zips, mod-specific
+/// data dirs, etc.) is drift that shouldn't ship to other players. Deliberately an allowlist,
+/// not a denylist: new junk should have to be explicitly opted in, not explicitly excluded.
+const ALLOWED_OVERRIDE_TOP_LEVEL: &[&str] = &["config", "icon.png", "options.txt", "servers.dat"];
+
+fn collect_overrides(paths: &ModpackPaths, server: bool) -> Vec<(String, PathBuf)> {
+    walkdir::WalkDir::new(&paths.workdir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            let rel_path = e.path().strip_prefix(&paths.workdir).ok()?;
+            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+            let top = rel_str.split('/').next().unwrap_or(&rel_str);
+
+            if !ALLOWED_OVERRIDE_TOP_LEVEL.contains(&top)
+                || rel_str.contains(".connector")
+                || rel_str.split('/').any(|p| p == "server")
+                || (server && rel_str.contains(".client"))
+            {
+                return None;
+            }
+
+            Some((rel_str, e.into_path()))
+        })
+        .collect()
+}
+
+fn get_local_minecraft_version(paths: &ModpackPaths) -> anyhow::Result<String> {
+    let contents = fs::read_to_string(mmc_pack_path(paths))?;
+    let mmc_pack: serde_json::Value = serde_json::from_str(&contents)?;
+
+    let version = mmc_pack
+        .get("components")
+        .and_then(|c| c.as_array())
+        .and_then(|components| {
+            components
+                .iter()
+                .find(|c| c.get("uid").and_then(|u| u.as_str()) == Some("net.minecraft"))
+        })
+        .and_then(|c| c.get("version"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Minecraft component not found in mmc-pack.json"))?;
+
+    Ok(version.to_string())
+}
+
+/// Self-hosted equivalent of a Modrinth mrpack export: every mod is listed in `files[]`
+/// pointing at the same content-addressed S3 blobs `upload_mod_blob` already publishes.
+/// Unlike a Modrinth-CDN export, nothing needs to fall back to raw-embedding in
+/// `overrides/mods/` — our own bucket resolves every mod, so the pack stays lean (a few MB
+/// of config, not hundreds of MB of embedded jars).
+fn build_mrpack(
+    mods: &[(String, PathBuf)],
+    manifest: &[ModEntry],
+    overrides: &[(String, PathBuf)],
+    minecraft_version: &str,
+    neoforge_version: &str,
+    version: u32,
+    out_path: &Path,
+) -> anyhow::Result<()> {
+    let mut files = Vec::with_capacity(mods.len());
+    for (name, path) in mods {
+        let entry = manifest
+            .iter()
+            .find(|m| &m.name == name)
+            .ok_or_else(|| anyhow::anyhow!("mod {} missing from manifest", name))?;
+        let (sha1, sha512) = get_file_sha1_sha512(path)?;
+        let file_size = fs::metadata(path)?.len();
+        files.push(MrpackFile {
+            path: format!("mods/{}", name),
+            hashes: MrpackHashes { sha1, sha512 },
+            env: MrpackEnv { client: "required".to_string(), server: "required".to_string() },
+            downloads: vec![format!("{}/mods/{}.jar", CDN_URL, entry.hash)],
+            file_size,
+        });
+    }
+
+    let index = MrpackIndex {
+        format_version: 1,
+        game: "minecraft".to_string(),
+        version_id: version.to_string(),
+        name: "Wolfpack".to_string(),
+        summary: "The Wolfpack NeoForge modpack.".to_string(),
+        files,
+        dependencies: MrpackDependencies {
+            minecraft: minecraft_version.to_string(),
+            neoforge: neoforge_version.to_string(),
+        },
+    };
+
+    let file = fs::File::create(out_path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("modrinth.index.json", options)?;
+    zip.write_all(serde_json::to_string_pretty(&index)?.as_bytes())?;
+
+    for (rel_path, path) in overrides {
+        zip.start_file(format!("overrides/{}", rel_path), options)?;
+        zip.write_all(&fs::read(path)?)?;
+    }
+
+    zip.finish()?;
+    Ok(())
+}
+
+async fn upload_mrpack(client: &Client, modpack: &str, path: &Path) -> anyhow::Result<String> {
+    let key = format!("{}/{}.mrpack", modpack, modpack.to_uppercase());
+    let bytes = fs::read(path)?;
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(&key)
+        .body(ByteStream::from(bytes))
+        .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+        .content_type("application/x-modrinth-modpack+zip")
+        .cache_control(MUTABLE_CACHE_CONTROL)
+        .send()
+        .await?;
+    Ok(format!("{}/{}", CDN_URL, key))
+}
+
+async fn update_packs_manifest(client: &Client, modpack: &str, mrpack_url: &str) -> anyhow::Result<()> {
+    let mut manifest: PacksManifest = match get_object_text(client, "packs.json").await? {
+        Some(text) => serde_json::from_str(&text).unwrap_or_default(),
+        None => PacksManifest::default(),
+    };
+
+    if let Some(existing) = manifest.packs.iter_mut().find(|p| p.id == modpack) {
+        existing.mrpack_url = mrpack_url.to_string();
+    } else {
+        manifest.packs.push(PackEntry {
+            id: modpack.to_string(),
+            name: modpack.to_uppercase(),
+            description: format!("The {} modpack.", modpack.to_uppercase()),
+            mrpack_url: mrpack_url.to_string(),
+        });
+    }
+
+    let body = serde_json::to_string_pretty(&manifest)?;
+    put_object_text(client, "packs.json", body, "application/json").await
+}
+
 /* ---------------- S3 HELPERS ---------------- */
 
 async fn get_object_text(client: &Client, key: &str) -> anyhow::Result<Option<String>> {
@@ -153,6 +378,7 @@ async fn put_object_text(client: &Client, key: &str, body: String, content_type:
         .body(ByteStream::from(body.into_bytes()))
         .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
         .content_type(content_type)
+        .cache_control(MUTABLE_CACHE_CONTROL)
         .send()
         .await?;
     Ok(())
@@ -201,6 +427,7 @@ async fn upload_mod_blob(client: &Client, hash: &str, path: &Path) -> anyhow::Re
         .body(ByteStream::from(bytes))
         .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
         .content_type("application/java-archive")
+        .cache_control(IMMUTABLE_CACHE_CONTROL)
         .send()
         .await?;
     Ok(())
@@ -262,6 +489,7 @@ async fn main() -> anyhow::Result<()> {
 
     let modpack = parse_arg("--modpack", "wfp");
     let server = parse_flag("--server");
+    let force = parse_flag("--force");
     let paths = modpack_paths(&modpack, server)?;
     let prefix = format!("{}/{}", modpack, if server { "server" } else { "client" });
     println!("Modpack: {} ({})", modpack, if server { "server" } else { "client" });
@@ -283,7 +511,7 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::from_conf(config);
 
     println!("Scanning mods...");
-    let mods = collect_mods(&paths);
+    let mods = collect_mods(&paths, server);
     let minimal_excludes = load_minimal_excludes(&paths)?;
 
     println!("Hashing mods...");
@@ -294,7 +522,7 @@ async fn main() -> anyhow::Result<()> {
     let mut remote_manifest = get_remote_manifest(&client, &prefix).await?.unwrap_or_default();
     remote_manifest.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mods_changed = manifest != remote_manifest;
+    let mods_changed = manifest != remote_manifest || force;
 
     println!("Checking NeoForge version...");
     let local_neoforge_version = get_local_neoforge_version(&paths)?;
@@ -303,7 +531,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Local NeoForge: {}", local_neoforge_version);
     println!("Remote NeoForge: {:?}", remote_neoforge_version);
 
-    let neoforge_changed = Some(local_neoforge_version.clone()) != remote_neoforge_version;
+    let neoforge_changed = Some(local_neoforge_version.clone()) != remote_neoforge_version || force;
 
     if !mods_changed && !neoforge_changed {
         println!("No changes. Skipping upload.");
@@ -333,6 +561,34 @@ async fn main() -> anyhow::Result<()> {
     upload_version(&client, &prefix, new_version).await?;
 
     println!("Updated to version {}", new_version);
+
+    // The .mrpack is only meaningful as a from-scratch client install; server publishes
+    // don't have a corresponding "new instance" flow to feed.
+    if !server {
+        println!("Building mrpack...");
+        let overrides = collect_overrides(&paths, server);
+        let local_minecraft_version = get_local_minecraft_version(&paths)?;
+        let mrpack_path = env::temp_dir().join(format!("{}.mrpack", modpack));
+
+        build_mrpack(
+            &mods,
+            &manifest,
+            &overrides,
+            &local_minecraft_version,
+            &local_neoforge_version,
+            new_version,
+            &mrpack_path,
+        )?;
+
+        println!("Uploading mrpack...");
+        let mrpack_url = upload_mrpack(&client, &modpack, &mrpack_path).await?;
+        fs::remove_file(&mrpack_path).ok();
+
+        println!("Updating packs.json...");
+        update_packs_manifest(&client, &modpack, &mrpack_url).await?;
+
+        println!("mrpack published: {}", mrpack_url);
+    }
 
     Ok(())
 }
