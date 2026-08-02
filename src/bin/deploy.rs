@@ -546,51 +546,6 @@ async fn upload_resourcepack_blob(client: &Client, hash: &str, path: &Path) -> a
     Ok(())
 }
 
-/// Keeps the maintainer's own `options.txt` `resourcePacks` list in sync with which pack
-/// resourcepacks currently exist, so the diff picked up by the config-patch pipeline just below
-/// carries the enable/disable change like any other pack-managed key — no separate client-side
-/// wiring needed. Player-added entries (anything not `file/<pack-managed name>`) are left alone.
-fn sync_resource_pack_list(options_path: &Path, added: &[String], removed: &[String]) -> anyhow::Result<()> {
-    if added.is_empty() && removed.is_empty() {
-        return Ok(());
-    }
-
-    let text = fs::read_to_string(options_path).unwrap_or_default();
-    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-
-    let mut packs: Vec<String> = lines
-        .iter()
-        .find_map(|l| l.trim().strip_prefix("resourcePacks:"))
-        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
-        .unwrap_or_default();
-
-    for name in removed {
-        packs.retain(|p| p != &format!("file/{}", name));
-    }
-    for name in added {
-        let entry = format!("file/{}", name);
-        if !packs.contains(&entry) {
-            packs.push(entry);
-        }
-    }
-
-    let new_line = format!("resourcePacks:{}", serde_json::to_string(&packs)?);
-    let mut replaced = false;
-    for line in lines.iter_mut() {
-        if line.trim().starts_with("resourcePacks:") {
-            *line = new_line.clone();
-            replaced = true;
-            break;
-        }
-    }
-    if !replaced {
-        lines.push(new_line);
-    }
-
-    fs::write(options_path, lines.join("\n") + "\n")?;
-    Ok(())
-}
-
 async fn upload_version(client: &Client, prefix: &str, version: u32) -> anyhow::Result<()> {
     put_object_text(client, &format!("{}/version", prefix), version.to_string(), "text/plain").await
 }
@@ -706,21 +661,23 @@ async fn main() -> anyhow::Result<()> {
 
     let resourcepacks_changed = resourcepack_manifest != remote_resourcepack_manifest || (force && !server);
 
+    // Enabling/disabling in each player's own options.txt happens client-side, driven by what
+    // mcupdater actually adds/removes from their resourcepacks folder — see
+    // config_patch::merge_resource_pack_entries. Nothing to do here beyond publishing the
+    // manifest below.
     if resourcepacks_changed {
-        let added: Vec<String> = resourcepack_manifest
+        let added: Vec<&str> = resourcepack_manifest
             .iter()
-            .map(|e| e.name.clone())
-            .filter(|name| !remote_resourcepack_manifest.iter().any(|e| &e.name == name))
+            .map(|e| e.name.as_str())
+            .filter(|name| !remote_resourcepack_manifest.iter().any(|e| e.name == *name))
             .collect();
-        let removed: Vec<String> = remote_resourcepack_manifest
+        let removed: Vec<&str> = remote_resourcepack_manifest
             .iter()
-            .map(|e| e.name.clone())
-            .filter(|name| !resourcepack_manifest.iter().any(|e| &e.name == name))
+            .map(|e| e.name.as_str())
+            .filter(|name| !resourcepack_manifest.iter().any(|e| e.name == *name))
             .collect();
-
         if !added.is_empty() || !removed.is_empty() {
             println!("Resourcepacks added: {:?}, removed: {:?}", added, removed);
-            sync_resource_pack_list(&paths.workdir.join("options.txt"), &added, &removed)?;
         }
     }
 

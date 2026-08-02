@@ -346,6 +346,7 @@ fn main() -> anyhow::Result<()> {
         let resourcepack_backup_dir =
             Path::new(&inst_mc_dir).join(format!("resourcepacks_backup_{}", resourcepack_timestamp));
         let mut resourcepack_backup_created = false;
+        let mut removed_resourcepacks: Vec<String> = Vec::new();
 
         println!("Backing up outdated and removed resourcepacks...");
         for (name, local_hash) in &local_resourcepack_hashes {
@@ -364,10 +365,12 @@ fn main() -> anyhow::Result<()> {
                     fs::create_dir_all(parent)?;
                 }
                 rename(&src, &dst)?;
+                removed_resourcepacks.push(name.clone());
             }
         }
 
         println!("Downloading new and updated resourcepacks...");
+        let mut added_resourcepacks: Vec<String> = Vec::new();
         for entry in &resourcepack_manifest {
             let up_to_date = local_resourcepack_hashes.get(&entry.name) == Some(&entry.hash);
             if up_to_date {
@@ -385,7 +388,16 @@ fn main() -> anyhow::Result<()> {
                 .send()?;
             let mut out_file = File::create(&target_path)?;
             io::copy(&mut response, &mut out_file)?;
+            added_resourcepacks.push(entry.name.clone());
         }
+
+        // Merge (not overwrite) the enable/disable change into options.txt's resourcePacks list
+        // so a player's own entries and anything other mods register there survive untouched.
+        mcupdater::config_patch::merge_resource_pack_entries(
+            &Path::new(&inst_mc_dir).join("options.txt"),
+            &added_resourcepacks,
+            &removed_resourcepacks,
+        )?;
     } else {
         println!("No resourcepack manifest published. Skipping resourcepack sync.");
     }

@@ -387,10 +387,22 @@ fn apply_properties(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow
 
 /// Unlike `config/*.toml|json|properties` (pack-curated content, safe to track wholesale),
 /// `options.txt` is almost entirely the player's own client settings (sensitivity, sound,
-/// keybinds, gui scale, ...). Only keys the pack has actual business managing are tracked here
-/// — everything else must never end up in a diff/patch, or a maintainer's personal settings get
-/// shipped to every player on the next deploy.
-const TRACKED_OPTIONS_KEYS: &[&str] = &["resourcePacks"];
+/// keybinds, gui scale, ...). Only keys the pack has actual business managing — and where
+/// overwrite-on-change is actually correct — are tracked here; everything else must never end up
+/// in a diff/patch, or a maintainer's personal settings get shipped to every player on the next
+/// deploy. `resourcePacks` is deliberately NOT here: it's a list a player (or other mods) can add
+/// their own entries to, and this mechanism always overwrites a tracked key wholesale — correct
+/// for a scalar like a forced key, wrong for a list, where it'd nuke unrelated entries. See
+/// `merge_resource_pack_entries` for the list-merge this instead uses.
+const TRACKED_OPTIONS_KEYS: &[&str] = &[];
+
+/// Keybind lines (`key_key.foo:...`, `key_gui.bar:...`) are also trackable, but with different
+/// semantics than `TRACKED_OPTIONS_KEYS`: instead of "pack always wins", it's "seed the pack's
+/// value once, then leave it alone forever once a player's local value diverges from what was
+/// last seeded" — see `apply_options`'s use of the per-key seed-state file. This still risks a
+/// one-time rebind for a player who happened to already customize a key before the pack ever
+/// tracked it, but protects every customization after that.
+const SEEDED_OPTIONS_PREFIX: &str = "key_";
 
 fn extract_options(text: &str) -> BTreeMap<String, ConfigValue> {
     let mut out = BTreeMap::new();
@@ -401,7 +413,7 @@ fn extract_options(text: &str) -> BTreeMap<String, ConfigValue> {
         }
         if let Some((k, v)) = trimmed.split_once(':') {
             let key = k.trim();
-            if TRACKED_OPTIONS_KEYS.contains(&key) {
+            if TRACKED_OPTIONS_KEYS.contains(&key) || key.starts_with(SEEDED_OPTIONS_PREFIX) {
                 out.insert(key.to_string(), ConfigValue::String(v.trim().to_string()));
             }
         }
@@ -412,10 +424,41 @@ fn extract_options(text: &str) -> BTreeMap<String, ConfigValue> {
 fn apply_options(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-    let mut remaining: BTreeMap<String, String> = keys
+
+    let current: BTreeMap<String, String> = lines
         .iter()
-        .map(|(k, v)| (k.clone(), v.to_string()))
+        .filter_map(|l| {
+            let t = l.trim();
+            t.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        })
         .collect();
+
+    let seed_state_path = path.with_file_name(".mcupdater-keybind-state.json");
+    let mut seed_state: BTreeMap<String, String> = fs::read_to_string(&seed_state_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut seed_state_changed = false;
+
+    let mut remaining: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in keys {
+        let new_value = value.to_string();
+        if key.starts_with(SEEDED_OPTIONS_PREFIX) {
+            // Diverged = local value exists and no longer matches what we last seeded, meaning
+            // the player rebound it since. Absent from either side just means "never touched by
+            // us or the player" — safe (and, per product decision, intended) to seed.
+            let diverged = match (current.get(key), seed_state.get(key)) {
+                (Some(local), Some(last_seeded)) => local != last_seeded,
+                _ => false,
+            };
+            if diverged {
+                continue;
+            }
+            seed_state.insert(key.clone(), new_value.clone());
+            seed_state_changed = true;
+        }
+        remaining.insert(key.clone(), new_value);
+    }
 
     for line in lines.iter_mut() {
         let trimmed = line.trim();
@@ -432,9 +475,61 @@ fn apply_options(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::R
         lines.push(format!("{}:{}", key, value));
     }
 
+    if seed_state_changed {
+        fs::write(&seed_state_path, serde_json::to_string(&seed_state)?)?;
+    }
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
+/// Adds/removes exactly the given `file/<name>` entries in options.txt's `resourcePacks` list,
+/// leaving every other entry (a player's own packs, vanilla, ids other mods register, ...)
+/// untouched — unlike the generic key=val patching above, this is a merge, not an overwrite,
+/// since `resourcePacks` is a set the pack only partially owns.
+pub fn merge_resource_pack_entries(options_path: &Path, add: &[String], remove: &[String]) -> anyhow::Result<()> {
+    if add.is_empty() && remove.is_empty() {
+        return Ok(());
+    }
+
+    let text = fs::read_to_string(options_path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+
+    let mut packs: Vec<String> = lines
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("resourcePacks:"))
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_default();
+
+    for name in remove {
+        packs.retain(|p| p != &format!("file/{}", name));
+    }
+    for name in add {
+        let entry = format!("file/{}", name);
+        if !packs.contains(&entry) {
+            packs.push(entry);
+        }
+    }
+
+    let new_line = format!("resourcePacks:{}", serde_json::to_string(&packs)?);
+    let mut replaced = false;
+    for line in lines.iter_mut() {
+        if line.trim().starts_with("resourcePacks:") {
+            *line = new_line.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.push(new_line);
+    }
+
+    if let Some(parent) = options_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(options_path, lines.join("\n") + "\n")?;
     Ok(())
 }
