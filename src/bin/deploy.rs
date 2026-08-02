@@ -79,7 +79,10 @@ fn collect_mods(paths: &ModpackPaths) -> Vec<(String, PathBuf)> {
             let rel_path = e.path().strip_prefix(&mods_dir).ok()?;
             let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
-            if rel_str.contains(".connector") || rel_str.split('/').any(|p| p == "server") {
+            if rel_str.contains(".connector")
+                || rel_str.split('/').any(|p| p == "server")
+                || rel_str.ends_with(".zip")
+            {
                 return None;
             }
 
