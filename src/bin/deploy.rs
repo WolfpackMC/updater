@@ -2,7 +2,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-use mcupdater::config_patch::{self, ConfigMap};
+use wolfpacker::config_patch::{self, ConfigMap};
 use md5::{Digest, Md5};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -662,7 +662,7 @@ async fn main() -> anyhow::Result<()> {
     let resourcepacks_changed = resourcepack_manifest != remote_resourcepack_manifest || (force && !server);
 
     // Enabling/disabling in each player's own options.txt happens client-side, driven by what
-    // mcupdater actually adds/removes from their resourcepacks folder — see
+    // wolfpacker actually adds/removes from their resourcepacks folder — see
     // config_patch::merge_resource_pack_entries. Nothing to do here beyond publishing the
     // manifest below.
     if resourcepacks_changed {

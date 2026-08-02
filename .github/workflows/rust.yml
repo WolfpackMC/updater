@@ -34,13 +34,13 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
-    - name: Upload mcupdater artifact
+    - name: Upload wolfpacker artifact
       uses: actions/upload-artifact@v4
       with:
-        name: mcupdater-${{ matrix.name }}
+        name: wolfpacker-${{ matrix.name }}
         path: |
-          target/release/mcupdater
-          target/release/mcupdater.exe
+          target/release/wolfpacker
+          target/release/wolfpacker.exe
         if-no-files-found: ignore
 
     - name: Upload deploy artifact
@@ -60,30 +60,30 @@ jobs:
       contents: write
 
     steps:
-    - name: Download Windows mcupdater artifact
+    - name: Download Windows wolfpacker artifact
       uses: actions/download-artifact@v4
       with:
-        name: mcupdater-windows
+        name: wolfpacker-windows
         path: dist
 
-    - name: Download Linux mcupdater artifact
+    - name: Download Linux wolfpacker artifact
       uses: actions/download-artifact@v4
       with:
-        name: mcupdater-linux
+        name: wolfpacker-linux
         path: dist
 
-    - name: Download macOS mcupdater artifact
+    - name: Download macOS wolfpacker artifact
       uses: actions/download-artifact@v4
       with:
-        name: mcupdater-macos
+        name: wolfpacker-macos
         path: dist-macos
 
     - name: Rename release assets
       run: |
-        mv dist/mcupdater.exe dist/mcupdater-windows.exe
-        mv dist/mcupdater dist/mcupdater-linux
-        mv dist-macos/mcupdater dist/mcupdater-macos
-        chmod +x dist/mcupdater-linux dist/mcupdater-macos
+        mv dist/wolfpacker.exe dist/wolfpacker-windows.exe
+        mv dist/wolfpacker dist/wolfpacker-linux
+        mv dist-macos/wolfpacker dist/wolfpacker-macos
+        chmod +x dist/wolfpacker-linux dist/wolfpacker-macos
 
     - name: Publish rolling latest release
       uses: softprops/action-gh-release@v2
@@ -93,6 +93,6 @@ jobs:
         prerelease: true
         body: Automatically updated build from the latest main branch commit.
         files: |
-          dist/mcupdater-windows.exe
-          dist/mcupdater-linux
-          dist/mcupdater-macos
+          dist/wolfpacker-windows.exe
+          dist/wolfpacker-linux
+          dist/wolfpacker-macos

@@ -1,5 +1,5 @@
 //! Shared key=val config patching, used by `deploy` (extract + diff pack-managed keys) and
-//! `mcupdater` (apply them on top of a player's local config, overwriting only those keys).
+//! `wolfpacker` (apply them on top of a player's local config, overwriting only those keys).
 //! Player-added keys and files not touched by the pack are never read or written.
 
 use serde::{Deserialize, Serialize};
@@ -433,7 +433,7 @@ fn apply_options(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::R
         })
         .collect();
 
-    let seed_state_path = path.with_file_name(".mcupdater-keybind-state.json");
+    let seed_state_path = path.with_file_name(".wolfpacker-keybind-state.json");
     let mut seed_state: BTreeMap<String, String> = fs::read_to_string(&seed_state_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())

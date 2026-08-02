@@ -1,4 +1,4 @@
-# mcupdater
+# wolfpacker
 
 Self-updating mod sync + S3 publishing tool pair for the Wolfpack NeoForge modpack.
 
@@ -9,7 +9,7 @@ Self-updating mod sync + S3 publishing tool pair for the Wolfpack NeoForge modpa
 
 ## What it does
 
-`mcupdater` runs inside a PrismLauncher instance and keeps a player's local mod set in sync with a modpack published on S3/CDN — checking version, updating NeoForge, downloading and diffing the mod archive, and applying only what changed. `deploy` is the companion tool the pack maintainer runs locally to zip, hash, and publish a new mod set to S3.
+`wolfpacker` runs inside a PrismLauncher instance and keeps a player's local mod set in sync with a modpack published on S3/CDN — checking version, updating NeoForge, downloading and diffing the mod archive, and applying only what changed. `deploy` is the companion tool the pack maintainer runs locally to zip, hash, and publish a new mod set to S3.
 
 Both read/write through CloudFront (`wolfpack-cdn.kalkafox.dev`) rather than hitting the `wolfpackmc` S3 bucket directly, for regional download speed. Content-addressed objects (`mods/{hash}.jar`) are cached for a year (immutable — the hash guarantees the content never changes at that key). Mutable pointers (`version`, `neoforge-version`, `manifest.json`, `packs.json`, the `.mrpack`) are cached for only 60 seconds, so a publish is visible everywhere within a minute without needing an explicit CloudFront invalidation.
 
@@ -36,18 +36,18 @@ cd updater
 cargo build --release
 ```
 
-Produces two binaries in `target/release/`: `mcupdater` and `deploy`. CI also uploads a prebuilt `target/release` artifact on every push/PR to `main`.
+Produces two binaries in `target/release/`: `wolfpacker` and `deploy`. CI also uploads a prebuilt `target/release` artifact on every push/PR to `main`.
 
 ## Quick start
 
-### `mcupdater` (player-side)
+### `wolfpacker` (player-side)
 
 Invoked by PrismLauncher as a pre-launch task, which sets the required `INST_*` environment variables. To run manually for testing:
 
 ```bash
 INST_DIR="/path/to/instance" \
 INST_MC_DIR="/path/to/instance/minecraft" \
-./target/release/mcupdater
+./target/release/wolfpacker
 ```
 
 Programmatic equivalent of the core check, for reference:
@@ -76,7 +76,7 @@ On any client-side publish that changes mods or the NeoForge version, `deploy` a
 
 ## Configuration
 
-`mcupdater` reads these environment variables (set by PrismLauncher automatically when configured as a pre-launch command):
+`wolfpacker` reads these environment variables (set by PrismLauncher automatically when configured as a pre-launch command):
 
 | Variable | Purpose |
 |---|---|

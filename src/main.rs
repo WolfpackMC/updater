@@ -209,7 +209,7 @@ fn main() -> anyhow::Result<()> {
         if server {
             if check_neoforge_version_file(&inst_dir, &remote_neoforge_version)? {
                 println!(
-                    "NeoForge loader version changed to {} — reinstall it manually (e.g. via the Pterodactyl egg); mcupdater does not install the server loader.",
+                    "NeoForge loader version changed to {} — reinstall it manually (e.g. via the Pterodactyl egg); wolfpacker does not install the server loader.",
                     remote_neoforge_version
                 );
             } else {
@@ -393,7 +393,7 @@ fn main() -> anyhow::Result<()> {
 
         // Merge (not overwrite) the enable/disable change into options.txt's resourcePacks list
         // so a player's own entries and anything other mods register there survive untouched.
-        mcupdater::config_patch::merge_resource_pack_entries(
+        wolfpacker::config_patch::merge_resource_pack_entries(
             &Path::new(&inst_mc_dir).join("options.txt"),
             &added_resourcepacks,
             &removed_resourcepacks,
@@ -404,18 +404,18 @@ fn main() -> anyhow::Result<()> {
 
     println!("Fetching config patch...");
     match client.get(format!("{}/{}/config-patch.json", CDN_URL, prefix)).send() {
-        Ok(res) if res.status().is_success() => match res.json::<mcupdater::config_patch::ConfigMap>() {
+        Ok(res) if res.status().is_success() => match res.json::<wolfpacker::config_patch::ConfigMap>() {
             Ok(patch) => {
-                let current_values = mcupdater::config_patch::read_matching(Path::new(&inst_mc_dir), &patch);
-                let effective_diff = mcupdater::config_patch::diff(&patch, &current_values);
+                let current_values = wolfpacker::config_patch::read_matching(Path::new(&inst_mc_dir), &patch);
+                let effective_diff = wolfpacker::config_patch::diff(&patch, &current_values);
 
                 if effective_diff.is_empty() {
                     println!("Config already up to date.");
                 } else {
                     println!("Config changes:");
-                    mcupdater::config_patch::print_diff(&effective_diff, &current_values);
+                    wolfpacker::config_patch::print_diff(&effective_diff, &current_values);
                     println!("Applying config patch...");
-                    if let Err(e) = mcupdater::config_patch::apply_all(Path::new(&inst_mc_dir), &patch) {
+                    if let Err(e) = wolfpacker::config_patch::apply_all(Path::new(&inst_mc_dir), &patch) {
                         println!("Warning: failed to apply config patch: {}", e);
                     }
                 }
