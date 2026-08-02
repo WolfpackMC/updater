@@ -16,13 +16,17 @@ struct ModEntry {
     profiles: Vec<String>,
 }
 
-fn parse_profile_arg() -> String {
+fn parse_arg(flag: &str, default: &str) -> String {
     let args: Vec<String> = env::args().collect();
     args.iter()
-        .position(|a| a == "--profile")
+        .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .unwrap_or_else(|| "all".to_string())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn parse_flag(flag: &str) -> bool {
+    env::args().any(|a| a == flag)
 }
 
 fn file_md5(path: &Path) -> io::Result<String> {
@@ -120,8 +124,12 @@ fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Resu
 }
 
 fn main() -> anyhow::Result<()> {
-    let profile = parse_profile_arg();
+    let profile = parse_arg("--profile", "all");
+    let modpack = parse_arg("--modpack", "wfp");
+    let server = parse_flag("--server");
+    let prefix = format!("{}/{}", modpack, if server { "server" } else { "client" });
     println!("Using profile: {}", profile);
+    println!("Modpack: {} ({})", modpack, if server { "server" } else { "client" });
 
     let inst_name = env::var("INST_NAME").unwrap_or_default();
     let inst_id = env::var("INST_ID").unwrap_or_default();
@@ -142,7 +150,7 @@ fn main() -> anyhow::Result<()> {
     println!("Checking remote version...");
     let client = reqwest::blocking::Client::builder().build()?;
 
-    let res = client.get(format!("{}/version", S3_URL)).send()?;
+    let res = client.get(format!("{}/{}/version", S3_URL, prefix)).send()?;
     let remote_version_str = res.text()?;
     let remote_version: u32 = remote_version_str.trim().parse().unwrap_or(0);
     println!("Remote version: {}", remote_version);
@@ -153,7 +161,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("Checking NeoForge version...");
-    let neoforge_res = client.get(format!("{}/neoforge-version", S3_URL)).send()?;
+    let neoforge_res = client
+        .get(format!("{}/{}/neoforge-version", S3_URL, prefix))
+        .send()?;
 
     if neoforge_res.status().is_success() {
         let remote_neoforge_version = neoforge_res.text()?.trim().to_string();
@@ -169,7 +179,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Fetching mod manifest...");
     let full_manifest: Vec<ModEntry> = client
-        .get(format!("{}/manifest.json", S3_URL))
+        .get(format!("{}/{}/manifest.json", S3_URL, prefix))
         .send()?
         .json()?;
 

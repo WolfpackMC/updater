@@ -19,25 +19,48 @@ struct ModEntry {
     profiles: Vec<String>,
 }
 
-fn workdir() -> PathBuf {
-    PathBuf::from("E:\\PrismLauncher\\instances\\server\\minecraft")
+struct ModpackPaths {
+    workdir: PathBuf,
+    instance_dir: PathBuf,
 }
 
-fn instance_dir() -> PathBuf {
-    workdir().parent().unwrap().to_path_buf()
+/// Client and, optionally, dedicated server mod source dirs for a modpack id.
+/// Add new modpacks here as they're onboarded.
+fn modpack_workdir(modpack: &str, server: bool) -> anyhow::Result<PathBuf> {
+    match (modpack, server) {
+        ("wfp", false) => Ok(PathBuf::from(r"E:\PrismLauncher\instances\server\minecraft")),
+        ("wfp", true) => Ok(PathBuf::from(r"E:\PrismLauncher\instances\wfpserver\minecraft")),
+        _ => anyhow::bail!(
+            "Unknown modpack/variant combo: modpack={}, server={}",
+            modpack,
+            server
+        ),
+    }
 }
 
-fn mmc_pack_path() -> PathBuf {
-    instance_dir().join("mmc-pack.json")
+fn modpack_paths(modpack: &str, server: bool) -> anyhow::Result<ModpackPaths> {
+    let workdir = modpack_workdir(modpack, server)?;
+    let instance_dir = workdir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workdir {} has no parent", workdir.display()))?
+        .to_path_buf();
+    Ok(ModpackPaths {
+        workdir,
+        instance_dir,
+    })
 }
 
-fn profile_exclude_path() -> PathBuf {
-    workdir().join("profile-exclude.json")
+fn mmc_pack_path(paths: &ModpackPaths) -> PathBuf {
+    paths.instance_dir.join("mmc-pack.json")
+}
+
+fn profile_exclude_path(paths: &ModpackPaths) -> PathBuf {
+    paths.workdir.join("profile-exclude.json")
 }
 
 /// Substrings matched against mod filenames; a match excludes that mod from the "minimal" profile.
-fn load_minimal_excludes() -> anyhow::Result<Vec<String>> {
-    match fs::read_to_string(profile_exclude_path()) {
+fn load_minimal_excludes(paths: &ModpackPaths) -> anyhow::Result<Vec<String>> {
+    match fs::read_to_string(profile_exclude_path(paths)) {
         Ok(contents) => Ok(serde_json::from_str(&contents)?),
         Err(_) => Ok(Vec::new()),
     }
@@ -45,8 +68,8 @@ fn load_minimal_excludes() -> anyhow::Result<Vec<String>> {
 
 /* ---------------- MOD SCAN ---------------- */
 
-fn collect_mods() -> Vec<(String, PathBuf)> {
-    let mods_dir = workdir().join("mods");
+fn collect_mods(paths: &ModpackPaths) -> Vec<(String, PathBuf)> {
+    let mods_dir = paths.workdir.join("mods");
 
     walkdir::WalkDir::new(&mods_dir)
         .into_iter()
@@ -132,24 +155,24 @@ async fn put_object_text(client: &Client, key: &str, body: String, content_type:
     Ok(())
 }
 
-async fn get_version(client: &Client) -> anyhow::Result<u32> {
-    Ok(get_object_text(client, "version")
+async fn get_version(client: &Client, prefix: &str) -> anyhow::Result<u32> {
+    Ok(get_object_text(client, &format!("{}/version", prefix))
         .await?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0))
 }
 
-async fn get_remote_manifest(client: &Client) -> anyhow::Result<Option<Vec<ModEntry>>> {
-    match get_object_text(client, "manifest.json").await? {
+async fn get_remote_manifest(client: &Client, prefix: &str) -> anyhow::Result<Option<Vec<ModEntry>>> {
+    match get_object_text(client, &format!("{}/manifest.json", prefix)).await? {
         // an old-schema or malformed manifest is treated as absent, forcing a full republish
         Some(text) => Ok(serde_json::from_str(&text).ok()),
         None => Ok(None),
     }
 }
 
-async fn upload_manifest(client: &Client, manifest: &[ModEntry]) -> anyhow::Result<()> {
+async fn upload_manifest(client: &Client, prefix: &str, manifest: &[ModEntry]) -> anyhow::Result<()> {
     let body = serde_json::to_string(manifest)?;
-    put_object_text(client, "manifest.json", body, "application/json").await
+    put_object_text(client, &format!("{}/manifest.json", prefix), body, "application/json").await
 }
 
 async fn mod_blob_exists(client: &Client, hash: &str) -> anyhow::Result<bool> {
@@ -180,14 +203,14 @@ async fn upload_mod_blob(client: &Client, hash: &str, path: &Path) -> anyhow::Re
     Ok(())
 }
 
-async fn upload_version(client: &Client, version: u32) -> anyhow::Result<()> {
-    put_object_text(client, "version", version.to_string(), "text/plain").await
+async fn upload_version(client: &Client, prefix: &str, version: u32) -> anyhow::Result<()> {
+    put_object_text(client, &format!("{}/version", prefix), version.to_string(), "text/plain").await
 }
 
 /* ---------------- NEOFORGE ---------------- */
 
-fn get_local_neoforge_version() -> anyhow::Result<String> {
-    let contents = fs::read_to_string(mmc_pack_path())?;
+fn get_local_neoforge_version(paths: &ModpackPaths) -> anyhow::Result<String> {
+    let contents = fs::read_to_string(mmc_pack_path(paths))?;
     let mmc_pack: serde_json::Value = serde_json::from_str(&contents)?;
 
     let version = mmc_pack
@@ -205,12 +228,27 @@ fn get_local_neoforge_version() -> anyhow::Result<String> {
     Ok(version.to_string())
 }
 
-async fn get_remote_neoforge_version(client: &Client) -> anyhow::Result<Option<String>> {
-    get_object_text(client, "neoforge-version").await
+async fn get_remote_neoforge_version(client: &Client, prefix: &str) -> anyhow::Result<Option<String>> {
+    get_object_text(client, &format!("{}/neoforge-version", prefix)).await
 }
 
-async fn upload_neoforge_version(client: &Client, version: &str) -> anyhow::Result<()> {
-    put_object_text(client, "neoforge-version", version.to_string(), "text/plain").await
+async fn upload_neoforge_version(client: &Client, prefix: &str, version: &str) -> anyhow::Result<()> {
+    put_object_text(client, &format!("{}/neoforge-version", prefix), version.to_string(), "text/plain").await
+}
+
+/* ---------------- ARGS ---------------- */
+
+fn parse_arg(flag: &str, default: &str) -> String {
+    let args: Vec<String> = env::args().collect();
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn parse_flag(flag: &str) -> bool {
+    env::args().any(|a| a == flag)
 }
 
 /* ---------------- MAIN ---------------- */
@@ -218,6 +256,12 @@ async fn upload_neoforge_version(client: &Client, version: &str) -> anyhow::Resu
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+
+    let modpack = parse_arg("--modpack", "wfp");
+    let server = parse_flag("--server");
+    let paths = modpack_paths(&modpack, server)?;
+    let prefix = format!("{}/{}", modpack, if server { "server" } else { "client" });
+    println!("Modpack: {} ({})", modpack, if server { "server" } else { "client" });
 
     let credentials = Credentials::new(
         env::var("AWS_ACCESS_ID").unwrap_or_default(),
@@ -236,22 +280,22 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::from_conf(config);
 
     println!("Scanning mods...");
-    let mods = collect_mods();
-    let minimal_excludes = load_minimal_excludes()?;
+    let mods = collect_mods(&paths);
+    let minimal_excludes = load_minimal_excludes(&paths)?;
 
     println!("Hashing mods...");
     let mut manifest = build_manifest(&mods, &minimal_excludes)?;
     manifest.sort_by(|a, b| a.name.cmp(&b.name));
 
     println!("Fetching remote manifest...");
-    let mut remote_manifest = get_remote_manifest(&client).await?.unwrap_or_default();
+    let mut remote_manifest = get_remote_manifest(&client, &prefix).await?.unwrap_or_default();
     remote_manifest.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mods_changed = manifest != remote_manifest;
 
     println!("Checking NeoForge version...");
-    let local_neoforge_version = get_local_neoforge_version()?;
-    let remote_neoforge_version = get_remote_neoforge_version(&client).await?;
+    let local_neoforge_version = get_local_neoforge_version(&paths)?;
+    let remote_neoforge_version = get_remote_neoforge_version(&client, &prefix).await?;
 
     println!("Local NeoForge: {}", local_neoforge_version);
     println!("Remote NeoForge: {:?}", remote_neoforge_version);
@@ -273,17 +317,17 @@ async fn main() -> anyhow::Result<()> {
                 upload_mod_blob(&client, &entry.hash, path).await?;
             }
         }
-        upload_manifest(&client, &manifest).await?;
+        upload_manifest(&client, &prefix, &manifest).await?;
     }
 
     if neoforge_changed {
-        upload_neoforge_version(&client, &local_neoforge_version).await?;
+        upload_neoforge_version(&client, &prefix, &local_neoforge_version).await?;
     }
 
-    let current_version = get_version(&client).await?;
+    let current_version = get_version(&client, &prefix).await?;
     let new_version = current_version + 1;
 
-    upload_version(&client, new_version).await?;
+    upload_version(&client, &prefix, new_version).await?;
 
     println!("Updated to version {}", new_version);
 
