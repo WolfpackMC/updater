@@ -123,6 +123,20 @@ fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Resu
     )
 }
 
+// Server variant has no mmc-pack.json (no PrismLauncher) and no automated loader install here —
+// just track the last-seen remote version in a plain file so a mismatch is visible in logs
+// and the operator knows to reinstall the loader (e.g. via the Pterodactyl egg).
+fn check_neoforge_version_file(inst_dir: &str, remote_version: &str) -> anyhow::Result<bool> {
+    let version_file = Path::new(inst_dir).join("neoforge-version");
+
+    let local_version = fs::read_to_string(&version_file).ok();
+    let changed = local_version.as_deref() != Some(remote_version);
+
+    fs::write(&version_file, remote_version)?;
+
+    Ok(changed)
+}
+
 fn main() -> anyhow::Result<()> {
     let profile = parse_arg("--profile", "all");
     let modpack = parse_arg("--modpack", "wfp");
@@ -133,10 +147,20 @@ fn main() -> anyhow::Result<()> {
 
     let inst_name = env::var("INST_NAME").unwrap_or_default();
     let inst_id = env::var("INST_ID").unwrap_or_default();
-    let inst_dir = env::var("INST_DIR").unwrap_or_default();
-    let inst_mc_dir = env::var("INST_MC_DIR").unwrap_or_default();
     let inst_java = env::var("INST_JAVA").unwrap_or_default();
     let inst_java_args = env::var("INST_JAVA_ARGS").unwrap_or_default();
+
+    // Outside PrismLauncher (e.g. a Pterodactyl server egg) INST_DIR/INST_MC_DIR aren't set;
+    // fall back to the working directory, matching the flat volumes/<uuid> layout.
+    let cwd = env::current_dir()?.to_string_lossy().to_string();
+    let inst_dir = env::var("INST_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cwd.clone());
+    let inst_mc_dir = env::var("INST_MC_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(cwd);
 
     let version_path = Path::new(&inst_dir).join("version");
 
@@ -168,7 +192,16 @@ fn main() -> anyhow::Result<()> {
     if neoforge_res.status().is_success() {
         let remote_neoforge_version = neoforge_res.text()?.trim().to_string();
 
-        if update_neoforge_version(&inst_dir, &remote_neoforge_version)? {
+        if server {
+            if check_neoforge_version_file(&inst_dir, &remote_neoforge_version)? {
+                println!(
+                    "NeoForge loader version changed to {} — reinstall it manually (e.g. via the Pterodactyl egg); mcupdater does not install the server loader.",
+                    remote_neoforge_version
+                );
+            } else {
+                println!("NeoForge is already up to date.");
+            }
+        } else if update_neoforge_version(&inst_dir, &remote_neoforge_version)? {
             println!("Updated NeoForge to version {}", remote_neoforge_version);
         } else {
             println!("NeoForge is already up to date.");
