@@ -547,12 +547,13 @@ async fn main() -> anyhow::Result<()> {
     let overrides = collect_overrides(&paths, server);
     let config_files: Vec<(String, PathBuf)> = overrides
         .iter()
-        .filter(|(rel, _)| rel.starts_with("config/"))
         .filter(|(rel, _)| {
-            matches!(
-                Path::new(rel).extension().and_then(|e| e.to_str()),
-                Some("toml") | Some("json") | Some("properties")
-            )
+            rel.as_str() == "options.txt"
+                || (rel.starts_with("config/")
+                    && matches!(
+                        Path::new(rel).extension().and_then(|e| e.to_str()),
+                        Some("toml") | Some("json") | Some("properties")
+                    ))
         })
         .cloned()
         .collect();
@@ -590,6 +591,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config_changed {
+        println!("Config changes:");
+        config_patch::print_diff(&config_delta, &baseline_config);
         println!("Updating config patch...");
         let mut remote_patch: ConfigMap = get_object_text(&client, &format!("{}/config-patch.json", prefix))
             .await?

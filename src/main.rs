@@ -314,9 +314,18 @@ fn main() -> anyhow::Result<()> {
     match client.get(format!("{}/{}/config-patch.json", CDN_URL, prefix)).send() {
         Ok(res) if res.status().is_success() => match res.json::<mcupdater::config_patch::ConfigMap>() {
             Ok(patch) => {
-                println!("Applying config patch...");
-                if let Err(e) = mcupdater::config_patch::apply_all(Path::new(&inst_mc_dir), &patch) {
-                    println!("Warning: failed to apply config patch: {}", e);
+                let current_values = mcupdater::config_patch::read_matching(Path::new(&inst_mc_dir), &patch);
+                let effective_diff = mcupdater::config_patch::diff(&patch, &current_values);
+
+                if effective_diff.is_empty() {
+                    println!("Config already up to date.");
+                } else {
+                    println!("Config changes:");
+                    mcupdater::config_patch::print_diff(&effective_diff, &current_values);
+                    println!("Applying config patch...");
+                    if let Err(e) = mcupdater::config_patch::apply_all(Path::new(&inst_mc_dir), &patch) {
+                        println!("Warning: failed to apply config patch: {}", e);
+                    }
                 }
             }
             Err(e) => println!("Warning: malformed config patch, skipping: {}", e),

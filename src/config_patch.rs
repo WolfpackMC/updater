@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,13 +17,13 @@ pub enum ConfigValue {
     Bool(bool),
 }
 
-impl ConfigValue {
-    fn as_property_string(&self) -> String {
+impl fmt::Display for ConfigValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigValue::String(s) => s.clone(),
-            ConfigValue::Integer(i) => i.to_string(),
-            ConfigValue::Float(f) => f.to_string(),
-            ConfigValue::Bool(b) => b.to_string(),
+            ConfigValue::String(s) => write!(f, "{}", s),
+            ConfigValue::Integer(i) => write!(f, "{}", i),
+            ConfigValue::Float(v) => write!(f, "{}", v),
+            ConfigValue::Bool(b) => write!(f, "{}", b),
         }
     }
 }
@@ -36,17 +37,17 @@ pub fn extract_all(files: &[(String, PathBuf)]) -> ConfigMap {
     let mut map = ConfigMap::new();
 
     for (rel_path, path) in files {
-        let ext = Path::new(rel_path).extension().and_then(|e| e.to_str()).unwrap_or("");
         let text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(_) => continue,
         };
 
-        let keys = match ext {
-            "toml" => extract_toml(&text),
-            "json" => extract_json(&text),
-            "properties" => extract_properties(&text),
-            _ => continue,
+        let keys = match file_kind(rel_path) {
+            Some(FileKind::Toml) => extract_toml(&text),
+            Some(FileKind::Json) => extract_json(&text),
+            Some(FileKind::Properties) => extract_properties(&text),
+            Some(FileKind::Options) => extract_options(&text),
+            None => continue,
         };
 
         if !keys.is_empty() {
@@ -55,6 +56,28 @@ pub fn extract_all(files: &[(String, PathBuf)]) -> ConfigMap {
     }
 
     map
+}
+
+enum FileKind {
+    Toml,
+    Json,
+    Properties,
+    Options,
+}
+
+/// Classifies a pack-managed config path by how it should be parsed/patched. `options.txt`
+/// (Minecraft's own `key:value` file, sitting at the instance root rather than under `config/`)
+/// is matched by name, not extension.
+fn file_kind(rel_path: &str) -> Option<FileKind> {
+    if Path::new(rel_path).file_name().and_then(|f| f.to_str()) == Some("options.txt") {
+        return Some(FileKind::Options);
+    }
+    match Path::new(rel_path).extension().and_then(|e| e.to_str()) {
+        Some("toml") => Some(FileKind::Toml),
+        Some("json") => Some(FileKind::Json),
+        Some("properties") => Some(FileKind::Properties),
+        _ => None,
+    }
 }
 
 /// Keys present (with a different or new value) in `current` but not matching `baseline`.
@@ -83,16 +106,76 @@ pub fn merge(base: &mut ConfigMap, updates: &ConfigMap) {
     }
 }
 
+/// Reads current on-disk values, but only for the files/keys named in `wanted` — used to see
+/// what a patch is about to change before applying it. A key absent from the result means the
+/// file or key doesn't exist locally yet.
+pub fn read_matching(config_dir_root: &Path, wanted: &ConfigMap) -> ConfigMap {
+    let mut out = ConfigMap::new();
+
+    for (rel_path, keys) in wanted {
+        let path = config_dir_root.join(rel_path);
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let current_all = match file_kind(rel_path) {
+            Some(FileKind::Toml) => extract_toml(&text),
+            Some(FileKind::Json) => extract_json(&text),
+            Some(FileKind::Properties) => extract_properties(&text),
+            Some(FileKind::Options) => extract_options(&text),
+            None => continue,
+        };
+
+        let mut matched = BTreeMap::new();
+        for key in keys.keys() {
+            if let Some(v) = current_all.get(key) {
+                matched.insert(key.clone(), v.clone());
+            }
+        }
+
+        if !matched.is_empty() {
+            out.insert(rel_path.clone(), matched);
+        }
+    }
+
+    out
+}
+
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const RESET: &str = "\x1b[0m";
+
+/// Prints `delta` (new values) against `old` (previous values, if any) as a colored +/- diff,
+/// e.g.:
+///   config/mymod-common.toml
+///     server.maxPlayers
+///       - 20
+///       + 50
+pub fn print_diff(delta: &ConfigMap, old: &ConfigMap) {
+    for (file, keys) in delta {
+        println!("{}", file);
+        for (key, new_value) in keys {
+            println!("  {}", key);
+            if let Some(old_value) = old.get(file).and_then(|m| m.get(key)) {
+                println!("    {}- {}{}", RED, old_value, RESET);
+            }
+            println!("    {}+ {}{}", GREEN, new_value, RESET);
+        }
+    }
+}
+
 /// Applies a patch under `config_dir_root` (the dir containing `config/...`, i.e. the instance
 /// minecraft dir). Pack values always win over whatever the player has in that key.
 pub fn apply_all(config_dir_root: &Path, patch: &ConfigMap) -> anyhow::Result<()> {
     for (rel_path, keys) in patch {
         let path = config_dir_root.join(rel_path);
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("toml") => apply_toml(&path, keys)?,
-            Some("json") => apply_json(&path, keys)?,
-            Some("properties") => apply_properties(&path, keys)?,
-            _ => {}
+        match file_kind(rel_path) {
+            Some(FileKind::Toml) => apply_toml(&path, keys)?,
+            Some(FileKind::Json) => apply_json(&path, keys)?,
+            Some(FileKind::Properties) => apply_properties(&path, keys)?,
+            Some(FileKind::Options) => apply_options(&path, keys)?,
+            None => {}
         }
     }
 
@@ -271,7 +354,7 @@ fn apply_properties(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut remaining: BTreeMap<String, String> = keys
         .iter()
-        .map(|(k, v)| (k.clone(), v.as_property_string()))
+        .map(|(k, v)| (k.clone(), v.to_string()))
         .collect();
 
     for line in lines.iter_mut() {
@@ -287,6 +370,56 @@ fn apply_properties(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow
 
     for (key, value) in remaining {
         lines.push(format!("{}={}", key, value));
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
+/* ---------------- OPTIONS.TXT ---------------- */
+//
+// Minecraft's own format: one `key:value` per line, no comments. Same overwrite-known-keys,
+// leave-everything-else-untouched semantics as `properties` so a player's other settings
+// (video/sound/keybinds/etc.) never get touched by a pack-managed key.
+
+fn extract_options(text: &str) -> BTreeMap<String, ConfigValue> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            out.insert(k.trim().to_string(), ConfigValue::String(v.trim().to_string()));
+        }
+    }
+    out
+}
+
+fn apply_options(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::Result<()> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut remaining: BTreeMap<String, String> = keys
+        .iter()
+        .map(|(k, v)| (k.clone(), v.to_string()))
+        .collect();
+
+    for line in lines.iter_mut() {
+        let trimmed = line.trim();
+        if !trimmed.contains(':') {
+            continue;
+        }
+        let key = trimmed.split(':').next().unwrap().trim().to_string();
+        if let Some(new_value) = remaining.remove(&key) {
+            *line = format!("{}:{}", key, new_value);
+        }
+    }
+
+    for (key, value) in remaining {
+        lines.push(format!("{}:{}", key, value));
     }
 
     if let Some(parent) = path.parent() {
