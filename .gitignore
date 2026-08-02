@@ -3,4 +3,5 @@
 version
 .idea
 .env
+/config-baseline
 

@@ -2,6 +2,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use mcupdater::config_patch::{self, ConfigMap};
 use md5::{Digest, Md5};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,15 @@ fn mmc_pack_path(paths: &ModpackPaths) -> PathBuf {
 
 fn profile_exclude_path(paths: &ModpackPaths) -> PathBuf {
     paths.workdir.join("profile-exclude.json")
+}
+
+/// Local (maintainer-machine-only) snapshot of every pack-managed config key's value as of the
+/// last deploy, used to detect which keys changed this run. Not uploaded anywhere — the
+/// cumulative result of every such diff is what gets published as `config-patch.json`.
+fn config_baseline_path(modpack: &str, server: bool) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("config-baseline")
+        .join(format!("{}-{}.json", modpack, if server { "server" } else { "client" }))
 }
 
 /// Substrings matched against mod filenames; a match excludes that mod from the "minimal" profile.
@@ -533,7 +543,31 @@ async fn main() -> anyhow::Result<()> {
 
     let neoforge_changed = Some(local_neoforge_version.clone()) != remote_neoforge_version || force;
 
-    if !mods_changed && !neoforge_changed {
+    println!("Scanning config...");
+    let overrides = collect_overrides(&paths, server);
+    let config_files: Vec<(String, PathBuf)> = overrides
+        .iter()
+        .filter(|(rel, _)| rel.starts_with("config/"))
+        .filter(|(rel, _)| {
+            matches!(
+                Path::new(rel).extension().and_then(|e| e.to_str()),
+                Some("toml") | Some("json") | Some("properties")
+            )
+        })
+        .cloned()
+        .collect();
+    let current_config = config_patch::extract_all(&config_files);
+
+    let baseline_path = config_baseline_path(&modpack, server);
+    let baseline_config: ConfigMap = fs::read_to_string(&baseline_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+
+    let config_delta = config_patch::diff(&current_config, &baseline_config);
+    let config_changed = !config_delta.is_empty() || force;
+
+    if !mods_changed && !neoforge_changed && !config_changed {
         println!("No changes. Skipping upload.");
         return Ok(());
     }
@@ -555,6 +589,23 @@ async fn main() -> anyhow::Result<()> {
         upload_neoforge_version(&client, &prefix, &local_neoforge_version).await?;
     }
 
+    if config_changed {
+        println!("Updating config patch...");
+        let mut remote_patch: ConfigMap = get_object_text(&client, &format!("{}/config-patch.json", prefix))
+            .await?
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        config_patch::merge(&mut remote_patch, &config_delta);
+
+        let body = serde_json::to_string(&remote_patch)?;
+        put_object_text(&client, &format!("{}/config-patch.json", prefix), body, "application/json").await?;
+
+        if let Some(parent) = baseline_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&baseline_path, serde_json::to_string(&current_config)?)?;
+    }
+
     let current_version = get_version(&client, &prefix).await?;
     let new_version = current_version + 1;
 
@@ -566,7 +617,6 @@ async fn main() -> anyhow::Result<()> {
     // don't have a corresponding "new instance" flow to feed.
     if !server {
         println!("Building mrpack...");
-        let overrides = collect_overrides(&paths, server);
         let local_minecraft_version = get_local_minecraft_version(&paths)?;
         let mrpack_path = env::temp_dir().join(format!("{}.mrpack", modpack));
 

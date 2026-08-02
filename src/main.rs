@@ -310,6 +310,21 @@ fn main() -> anyhow::Result<()> {
         io::copy(&mut response, &mut out_file)?;
     }
 
+    println!("Fetching config patch...");
+    match client.get(format!("{}/{}/config-patch.json", CDN_URL, prefix)).send() {
+        Ok(res) if res.status().is_success() => match res.json::<mcupdater::config_patch::ConfigMap>() {
+            Ok(patch) => {
+                println!("Applying config patch...");
+                if let Err(e) = mcupdater::config_patch::apply_all(Path::new(&inst_mc_dir), &patch) {
+                    println!("Warning: failed to apply config patch: {}", e);
+                }
+            }
+            Err(e) => println!("Warning: malformed config patch, skipping: {}", e),
+        },
+        Ok(_) => println!("No config patch published. Skipping config sync."),
+        Err(e) => println!("Warning: failed to fetch config patch: {}", e),
+    }
+
     println!("Updating local version file...");
     fs::write(&version_path, remote_version.to_string())?;
     fs::write(&profile_path, &profile)?;

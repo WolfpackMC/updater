@@ -19,4 +19,6 @@ sha2 = "0.10"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 dotenvy = "0.15"
 rayon = "1"
+toml = "0.8"
+toml_edit = "0.22"
 
