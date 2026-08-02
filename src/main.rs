@@ -15,6 +15,12 @@ struct ModEntry {
     profiles: Vec<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct ResourcePackEntry {
+    name: String,
+    hash: String,
+}
+
 fn parse_arg(flag: &str, default: &str) -> String {
     let args: Vec<String> = env::args().collect();
     args.iter()
@@ -308,6 +314,80 @@ fn main() -> anyhow::Result<()> {
             .send()?;
         let mut out_file = File::create(&target_path)?;
         io::copy(&mut response, &mut out_file)?;
+    }
+
+    println!("Fetching resourcepack manifest...");
+    let resourcepack_manifest_res = client
+        .get(format!("{}/{}/resourcepacks-manifest.json", CDN_URL, prefix))
+        .send()?;
+
+    if resourcepack_manifest_res.status().is_success() {
+        let resourcepack_manifest: Vec<ResourcePackEntry> = resourcepack_manifest_res.json()?;
+
+        let resourcepacks_dir = Path::new(&inst_mc_dir).join("resourcepacks");
+        fs::create_dir_all(&resourcepacks_dir)?;
+
+        println!("Hashing local resourcepacks...");
+        let mut local_resourcepack_hashes: HashMap<String, String> = HashMap::new();
+        for entry in walkdir::WalkDir::new(&resourcepacks_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+        {
+            let rel = entry
+                .path()
+                .strip_prefix(&resourcepacks_dir)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            local_resourcepack_hashes.insert(rel, file_md5(entry.path())?);
+        }
+
+        let resourcepack_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let resourcepack_backup_dir =
+            Path::new(&inst_mc_dir).join(format!("resourcepacks_backup_{}", resourcepack_timestamp));
+        let mut resourcepack_backup_created = false;
+
+        println!("Backing up outdated and removed resourcepacks...");
+        for (name, local_hash) in &local_resourcepack_hashes {
+            let up_to_date = resourcepack_manifest
+                .iter()
+                .any(|p| &p.name == name && &p.hash == local_hash);
+
+            if !up_to_date {
+                if !resourcepack_backup_created {
+                    fs::create_dir_all(&resourcepack_backup_dir)?;
+                    resourcepack_backup_created = true;
+                }
+                let src = resourcepacks_dir.join(name);
+                let dst = resourcepack_backup_dir.join(name);
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                rename(&src, &dst)?;
+            }
+        }
+
+        println!("Downloading new and updated resourcepacks...");
+        for entry in &resourcepack_manifest {
+            let up_to_date = local_resourcepack_hashes.get(&entry.name) == Some(&entry.hash);
+            if up_to_date {
+                continue;
+            }
+
+            println!("Downloading {}...", entry.name);
+            let target_path = resourcepacks_dir.join(&entry.name);
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let mut response = client
+                .get(format!("{}/resourcepacks/{}.zip", CDN_URL, entry.hash))
+                .send()?;
+            let mut out_file = File::create(&target_path)?;
+            io::copy(&mut response, &mut out_file)?;
+        }
+    } else {
+        println!("No resourcepack manifest published. Skipping resourcepack sync.");
     }
 
     println!("Fetching config patch...");

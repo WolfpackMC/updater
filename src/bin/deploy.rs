@@ -28,6 +28,14 @@ struct ModEntry {
     profiles: Vec<String>,
 }
 
+/// Resourcepacks ship to every profile (no minimal split) and are content-addressed the same
+/// way mods are — `resourcepacks/{hash}.zip` in the bucket.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct ResourcePackEntry {
+    name: String,
+    hash: String,
+}
+
 struct ModpackPaths {
     workdir: PathBuf,
     instance_dir: PathBuf,
@@ -106,6 +114,33 @@ fn collect_mods(paths: &ModpackPaths, server: bool) -> Vec<(String, PathBuf)> {
             }
 
             Some((rel_str, e.into_path()))
+        })
+        .collect()
+}
+
+/* ---------------- RESOURCEPACK SCAN ---------------- */
+
+fn collect_resourcepacks(paths: &ModpackPaths) -> Vec<(String, PathBuf)> {
+    let resourcepacks_dir = paths.workdir.join("resourcepacks");
+
+    walkdir::WalkDir::new(&resourcepacks_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("zip"))
+        .filter_map(|e| {
+            let rel_path = e.path().strip_prefix(&resourcepacks_dir).ok()?;
+            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+            Some((rel_str, e.into_path()))
+        })
+        .collect()
+}
+
+fn build_resourcepack_manifest(packs: &[(String, PathBuf)]) -> anyhow::Result<Vec<ResourcePackEntry>> {
+    packs
+        .par_iter()
+        .map(|(name, path)| -> anyhow::Result<ResourcePackEntry> {
+            Ok(ResourcePackEntry { name: name.clone(), hash: get_file_md5(path)? })
         })
         .collect()
 }
@@ -272,13 +307,15 @@ fn get_local_minecraft_version(paths: &ModpackPaths) -> anyhow::Result<String> {
 fn build_mrpack(
     mods: &[(String, PathBuf)],
     manifest: &[ModEntry],
+    resourcepacks: &[(String, PathBuf)],
+    resourcepack_manifest: &[ResourcePackEntry],
     overrides: &[(String, PathBuf)],
     minecraft_version: &str,
     neoforge_version: &str,
     version: u32,
     out_path: &Path,
 ) -> anyhow::Result<()> {
-    let mut files = Vec::with_capacity(mods.len());
+    let mut files = Vec::with_capacity(mods.len() + resourcepacks.len());
     for (name, path) in mods {
         let entry = manifest
             .iter()
@@ -291,6 +328,22 @@ fn build_mrpack(
             hashes: MrpackHashes { sha1, sha512 },
             env: MrpackEnv { client: "required".to_string(), server: "required".to_string() },
             downloads: vec![format!("{}/mods/{}.jar", CDN_URL, entry.hash)],
+            file_size,
+        });
+    }
+
+    for (name, path) in resourcepacks {
+        let entry = resourcepack_manifest
+            .iter()
+            .find(|m| &m.name == name)
+            .ok_or_else(|| anyhow::anyhow!("resourcepack {} missing from manifest", name))?;
+        let (sha1, sha512) = get_file_sha1_sha512(path)?;
+        let file_size = fs::metadata(path)?.len();
+        files.push(MrpackFile {
+            path: format!("resourcepacks/{}", name),
+            hashes: MrpackHashes { sha1, sha512 },
+            env: MrpackEnv { client: "required".to_string(), server: "unsupported".to_string() },
+            downloads: vec![format!("{}/resourcepacks/{}.zip", CDN_URL, entry.hash)],
             file_size,
         });
     }
@@ -443,6 +496,101 @@ async fn upload_mod_blob(client: &Client, hash: &str, path: &Path) -> anyhow::Re
     Ok(())
 }
 
+/* ---------------- RESOURCEPACKS ---------------- */
+
+async fn get_remote_resourcepack_manifest(
+    client: &Client,
+    prefix: &str,
+) -> anyhow::Result<Option<Vec<ResourcePackEntry>>> {
+    match get_object_text(client, &format!("{}/resourcepacks-manifest.json", prefix)).await? {
+        Some(text) => Ok(serde_json::from_str(&text).ok()),
+        None => Ok(None),
+    }
+}
+
+async fn upload_resourcepack_manifest(
+    client: &Client,
+    prefix: &str,
+    manifest: &[ResourcePackEntry],
+) -> anyhow::Result<()> {
+    let body = serde_json::to_string(manifest)?;
+    put_object_text(client, &format!("{}/resourcepacks-manifest.json", prefix), body, "application/json").await
+}
+
+async fn resourcepack_blob_exists(client: &Client, hash: &str) -> anyhow::Result<bool> {
+    match client
+        .head_object()
+        .bucket(BUCKET)
+        .key(format!("resourcepacks/{}.zip", hash))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(SdkError::ServiceError(ctx)) if ctx.raw().status().as_u16() == 404 => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn upload_resourcepack_blob(client: &Client, hash: &str, path: &Path) -> anyhow::Result<()> {
+    let bytes = fs::read(path)?;
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(format!("resourcepacks/{}.zip", hash))
+        .body(ByteStream::from(bytes))
+        .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+        .content_type("application/zip")
+        .cache_control(IMMUTABLE_CACHE_CONTROL)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Keeps the maintainer's own `options.txt` `resourcePacks` list in sync with which pack
+/// resourcepacks currently exist, so the diff picked up by the config-patch pipeline just below
+/// carries the enable/disable change like any other pack-managed key — no separate client-side
+/// wiring needed. Player-added entries (anything not `file/<pack-managed name>`) are left alone.
+fn sync_resource_pack_list(options_path: &Path, added: &[String], removed: &[String]) -> anyhow::Result<()> {
+    if added.is_empty() && removed.is_empty() {
+        return Ok(());
+    }
+
+    let text = fs::read_to_string(options_path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+
+    let mut packs: Vec<String> = lines
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("resourcePacks:"))
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_default();
+
+    for name in removed {
+        packs.retain(|p| p != &format!("file/{}", name));
+    }
+    for name in added {
+        let entry = format!("file/{}", name);
+        if !packs.contains(&entry) {
+            packs.push(entry);
+        }
+    }
+
+    let new_line = format!("resourcePacks:{}", serde_json::to_string(&packs)?);
+    let mut replaced = false;
+    for line in lines.iter_mut() {
+        if line.trim().starts_with("resourcePacks:") {
+            *line = new_line.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.push(new_line);
+    }
+
+    fs::write(options_path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
 async fn upload_version(client: &Client, prefix: &str, version: u32) -> anyhow::Result<()> {
     put_object_text(client, &format!("{}/version", prefix), version.to_string(), "text/plain").await
 }
@@ -543,6 +691,39 @@ async fn main() -> anyhow::Result<()> {
 
     let neoforge_changed = Some(local_neoforge_version.clone()) != remote_neoforge_version || force;
 
+    // Client-only: the dedicated server doesn't render anything, so resourcepacks are never
+    // scanned/published for `--server` runs.
+    let resourcepacks: Vec<(String, PathBuf)> = if server { Vec::new() } else { collect_resourcepacks(&paths) };
+    let mut resourcepack_manifest = if server { Vec::new() } else { build_resourcepack_manifest(&resourcepacks)? };
+    resourcepack_manifest.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut remote_resourcepack_manifest = if server {
+        Vec::new()
+    } else {
+        get_remote_resourcepack_manifest(&client, &prefix).await?.unwrap_or_default()
+    };
+    remote_resourcepack_manifest.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let resourcepacks_changed = resourcepack_manifest != remote_resourcepack_manifest || (force && !server);
+
+    if resourcepacks_changed {
+        let added: Vec<String> = resourcepack_manifest
+            .iter()
+            .map(|e| e.name.clone())
+            .filter(|name| !remote_resourcepack_manifest.iter().any(|e| &e.name == name))
+            .collect();
+        let removed: Vec<String> = remote_resourcepack_manifest
+            .iter()
+            .map(|e| e.name.clone())
+            .filter(|name| !resourcepack_manifest.iter().any(|e| &e.name == name))
+            .collect();
+
+        if !added.is_empty() || !removed.is_empty() {
+            println!("Resourcepacks added: {:?}, removed: {:?}", added, removed);
+            sync_resource_pack_list(&paths.workdir.join("options.txt"), &added, &removed)?;
+        }
+    }
+
     println!("Scanning config...");
     let overrides = collect_overrides(&paths, server);
     let config_files: Vec<(String, PathBuf)> = overrides
@@ -568,7 +749,7 @@ async fn main() -> anyhow::Result<()> {
     let config_delta = config_patch::diff(&current_config, &baseline_config);
     let config_changed = !config_delta.is_empty() || force;
 
-    if !mods_changed && !neoforge_changed && !config_changed {
+    if !mods_changed && !neoforge_changed && !config_changed && !resourcepacks_changed {
         println!("No changes. Skipping upload.");
         return Ok(());
     }
@@ -584,6 +765,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         upload_manifest(&client, &prefix, &manifest).await?;
+    }
+
+    if resourcepacks_changed {
+        for (name, path) in &resourcepacks {
+            let entry = resourcepack_manifest.iter().find(|m| &m.name == name).unwrap();
+            if !resourcepack_blob_exists(&client, &entry.hash).await? {
+                println!("Uploading resourcepack {}", name);
+                upload_resourcepack_blob(&client, &entry.hash, path).await?;
+            }
+        }
+        upload_resourcepack_manifest(&client, &prefix, &resourcepack_manifest).await?;
     }
 
     if neoforge_changed {
@@ -626,6 +818,8 @@ async fn main() -> anyhow::Result<()> {
         build_mrpack(
             &mods,
             &manifest,
+            &resourcepacks,
+            &resourcepack_manifest,
             &overrides,
             &local_minecraft_version,
             &local_neoforge_version,

@@ -385,6 +385,13 @@ fn apply_properties(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow
 // leave-everything-else-untouched semantics as `properties` so a player's other settings
 // (video/sound/keybinds/etc.) never get touched by a pack-managed key.
 
+/// Unlike `config/*.toml|json|properties` (pack-curated content, safe to track wholesale),
+/// `options.txt` is almost entirely the player's own client settings (sensitivity, sound,
+/// keybinds, gui scale, ...). Only keys the pack has actual business managing are tracked here
+/// — everything else must never end up in a diff/patch, or a maintainer's personal settings get
+/// shipped to every player on the next deploy.
+const TRACKED_OPTIONS_KEYS: &[&str] = &["resourcePacks"];
+
 fn extract_options(text: &str) -> BTreeMap<String, ConfigValue> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
@@ -393,7 +400,10 @@ fn extract_options(text: &str) -> BTreeMap<String, ConfigValue> {
             continue;
         }
         if let Some((k, v)) = trimmed.split_once(':') {
-            out.insert(k.trim().to_string(), ConfigValue::String(v.trim().to_string()));
+            let key = k.trim();
+            if TRACKED_OPTIONS_KEYS.contains(&key) {
+                out.insert(key.to_string(), ConfigValue::String(v.trim().to_string()));
+            }
         }
     }
     out
