@@ -236,11 +236,11 @@ fn set_toml_key(table: &mut toml_edit::Table, key_path: &str, value: &ConfigValu
     let parts: Vec<&str> = key_path.split('.').collect();
     let mut current = table;
     for part in &parts[..parts.len() - 1] {
-        current = current
-            .entry(part)
-            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
-            .as_table_mut()
-            .expect("pack-managed config key path collides with a non-table value");
+        let entry = current.entry(part).or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        if entry.as_table().is_none() {
+            *entry = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        current = entry.as_table_mut().unwrap();
     }
 
     let leaf = parts[parts.len() - 1];
