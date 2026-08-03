@@ -21,6 +21,12 @@ struct ResourcePackEntry {
     hash: String,
 }
 
+#[derive(serde::Deserialize)]
+struct FtbQuestEntry {
+    name: String,
+    hash: String,
+}
+
 fn parse_arg(flag: &str, default: &str) -> String {
     let args: Vec<String> = env::args().collect();
     args.iter()
@@ -402,6 +408,80 @@ fn main() -> anyhow::Result<()> {
         println!("No resourcepack manifest published. Skipping resourcepack sync.");
     }
 
+    println!("Fetching FTB Quests manifest...");
+    let ftbquests_manifest_res = client
+        .get(format!("{}/{}/ftbquests-manifest.json", CDN_URL, prefix))
+        .send()?;
+
+    if ftbquests_manifest_res.status().is_success() {
+        let ftbquests_manifest: Vec<FtbQuestEntry> = ftbquests_manifest_res.json()?;
+
+        let ftbquests_dir = Path::new(&inst_mc_dir).join("config").join("ftbquests");
+        fs::create_dir_all(&ftbquests_dir)?;
+
+        println!("Hashing local FTB Quests files...");
+        let mut local_ftbquests_hashes: HashMap<String, String> = HashMap::new();
+        for entry in walkdir::WalkDir::new(&ftbquests_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+        {
+            let rel = entry
+                .path()
+                .strip_prefix(&ftbquests_dir)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            local_ftbquests_hashes.insert(rel, file_md5(entry.path())?);
+        }
+
+        let ftbquests_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let ftbquests_backup_dir =
+            Path::new(&inst_mc_dir).join(format!("ftbquests_backup_{}", ftbquests_timestamp));
+        let mut ftbquests_backup_created = false;
+
+        println!("Backing up outdated and removed FTB Quests files...");
+        for (name, local_hash) in &local_ftbquests_hashes {
+            let up_to_date = ftbquests_manifest
+                .iter()
+                .any(|q| &q.name == name && &q.hash == local_hash);
+
+            if !up_to_date {
+                if !ftbquests_backup_created {
+                    fs::create_dir_all(&ftbquests_backup_dir)?;
+                    ftbquests_backup_created = true;
+                }
+                let src = ftbquests_dir.join(name);
+                let dst = ftbquests_backup_dir.join(name);
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                rename(&src, &dst)?;
+            }
+        }
+
+        println!("Downloading new and updated FTB Quests files...");
+        for entry in &ftbquests_manifest {
+            let up_to_date = local_ftbquests_hashes.get(&entry.name) == Some(&entry.hash);
+            if up_to_date {
+                continue;
+            }
+
+            println!("Downloading {}...", entry.name);
+            let target_path = ftbquests_dir.join(&entry.name);
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let mut response = client
+                .get(format!("{}/ftbquests/{}", CDN_URL, entry.hash))
+                .send()?;
+            let mut out_file = File::create(&target_path)?;
+            io::copy(&mut response, &mut out_file)?;
+        }
+    } else {
+        println!("No FTB Quests manifest published. Skipping FTB Quests sync.");
+    }
+
     println!("Fetching config patch...");
     match client.get(format!("{}/{}/config-patch.json", CDN_URL, prefix)).send() {
         Ok(res) if res.status().is_success() => match res.json::<wolfpacker::config_patch::ConfigMap>() {
@@ -412,8 +492,6 @@ fn main() -> anyhow::Result<()> {
                 if effective_diff.is_empty() {
                     println!("Config already up to date.");
                 } else {
-                    println!("Config changes:");
-                    wolfpacker::config_patch::print_diff(&effective_diff, &current_values);
                     println!("Applying config patch...");
                     if let Err(e) = wolfpacker::config_patch::apply_all(Path::new(&inst_mc_dir), &patch) {
                         println!("Warning: failed to apply config patch: {}", e);

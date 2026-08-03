@@ -36,6 +36,16 @@ struct ResourcePackEntry {
     hash: String,
 }
 
+/// FTB Quests config files (quest chapters, lang, etc. under `config/ftbquests`) are whole-file,
+/// content-addressed the same way resourcepacks are — `ftbquests/{hash}` in the bucket. Unlike
+/// `config_patch`'s scalar key=val tracking, this ships the entire file verbatim, which is the
+/// only sane option for `.snbt` quest data that has no stable key=val shape to diff.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct FtbQuestEntry {
+    name: String,
+    hash: String,
+}
+
 struct ModpackPaths {
     workdir: PathBuf,
     instance_dir: PathBuf,
@@ -141,6 +151,44 @@ fn build_resourcepack_manifest(packs: &[(String, PathBuf)]) -> anyhow::Result<Ve
         .par_iter()
         .map(|(name, path)| -> anyhow::Result<ResourcePackEntry> {
             Ok(ResourcePackEntry { name: name.clone(), hash: get_file_md5(path)? })
+        })
+        .collect()
+}
+
+/* ---------------- FTBQUESTS SCAN ---------------- */
+
+/// Every file under `config/ftbquests`, recursively, no extension filter — quest chapters
+/// (`.snbt`), lang files (`.json`), chapter-group/index files, and anything else FTB Quests
+/// writes there all need to round-trip, so this deliberately doesn't narrow by type the way
+/// `collect_resourcepacks` narrows to `.zip`.
+fn collect_ftbquests(paths: &ModpackPaths, server: bool) -> Vec<(String, PathBuf)> {
+    let ftbquests_dir = paths.workdir.join("config").join("ftbquests");
+
+    walkdir::WalkDir::new(&ftbquests_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| {
+            let rel_path = e.path().strip_prefix(&ftbquests_dir).ok()?;
+            let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+
+            if rel_str.contains(".connector")
+                || rel_str.split('/').any(|p| p == "server")
+                || (server && rel_str.contains(".client"))
+            {
+                return None;
+            }
+
+            Some((rel_str, e.into_path()))
+        })
+        .collect()
+}
+
+fn build_ftbquests_manifest(files: &[(String, PathBuf)]) -> anyhow::Result<Vec<FtbQuestEntry>> {
+    files
+        .par_iter()
+        .map(|(name, path)| -> anyhow::Result<FtbQuestEntry> {
+            Ok(FtbQuestEntry { name: name.clone(), hash: get_file_md5(path)? })
         })
         .collect()
 }
@@ -546,6 +594,56 @@ async fn upload_resourcepack_blob(client: &Client, hash: &str, path: &Path) -> a
     Ok(())
 }
 
+/* ---------------- FTBQUESTS ---------------- */
+
+async fn get_remote_ftbquests_manifest(
+    client: &Client,
+    prefix: &str,
+) -> anyhow::Result<Option<Vec<FtbQuestEntry>>> {
+    match get_object_text(client, &format!("{}/ftbquests-manifest.json", prefix)).await? {
+        Some(text) => Ok(serde_json::from_str(&text).ok()),
+        None => Ok(None),
+    }
+}
+
+async fn upload_ftbquests_manifest(
+    client: &Client,
+    prefix: &str,
+    manifest: &[FtbQuestEntry],
+) -> anyhow::Result<()> {
+    let body = serde_json::to_string(manifest)?;
+    put_object_text(client, &format!("{}/ftbquests-manifest.json", prefix), body, "application/json").await
+}
+
+async fn ftbquests_blob_exists(client: &Client, hash: &str) -> anyhow::Result<bool> {
+    match client
+        .head_object()
+        .bucket(BUCKET)
+        .key(format!("ftbquests/{}", hash))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(SdkError::ServiceError(ctx)) if ctx.raw().status().as_u16() == 404 => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn upload_ftbquests_blob(client: &Client, hash: &str, path: &Path) -> anyhow::Result<()> {
+    let bytes = fs::read(path)?;
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(format!("ftbquests/{}", hash))
+        .body(ByteStream::from(bytes))
+        .acl(aws_sdk_s3::types::ObjectCannedAcl::PublicRead)
+        .content_type("application/octet-stream")
+        .cache_control(IMMUTABLE_CACHE_CONTROL)
+        .send()
+        .await?;
+    Ok(())
+}
+
 async fn upload_version(client: &Client, prefix: &str, version: u32) -> anyhow::Result<()> {
     put_object_text(client, &format!("{}/version", prefix), version.to_string(), "text/plain").await
 }
@@ -681,13 +779,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    println!("Scanning FTB Quests...");
+    let ftbquests = collect_ftbquests(&paths, server);
+    let mut ftbquests_manifest = build_ftbquests_manifest(&ftbquests)?;
+    ftbquests_manifest.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut remote_ftbquests_manifest = get_remote_ftbquests_manifest(&client, &prefix).await?.unwrap_or_default();
+    remote_ftbquests_manifest.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let ftbquests_changed = ftbquests_manifest != remote_ftbquests_manifest || force;
+
     println!("Scanning config...");
     let overrides = collect_overrides(&paths, server);
     let config_files: Vec<(String, PathBuf)> = overrides
         .iter()
         .filter(|(rel, _)| {
+            // `config/ftbquests/**` ships whole-file via the ftbquests manifest above, not via
+            // scalar key=val patching — tracking it here too would double-manage the same files.
             rel.as_str() == "options.txt"
                 || (rel.starts_with("config/")
+                    && !rel.starts_with("config/ftbquests/")
                     && matches!(
                         Path::new(rel).extension().and_then(|e| e.to_str()),
                         Some("toml") | Some("json") | Some("properties")
@@ -706,7 +817,7 @@ async fn main() -> anyhow::Result<()> {
     let config_delta = config_patch::diff(&current_config, &baseline_config);
     let config_changed = !config_delta.is_empty() || force;
 
-    if !mods_changed && !neoforge_changed && !config_changed && !resourcepacks_changed {
+    if !mods_changed && !neoforge_changed && !config_changed && !resourcepacks_changed && !ftbquests_changed {
         println!("No changes. Skipping upload.");
         return Ok(());
     }
@@ -733,6 +844,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         upload_resourcepack_manifest(&client, &prefix, &resourcepack_manifest).await?;
+    }
+
+    if ftbquests_changed {
+        for (name, path) in &ftbquests {
+            let entry = ftbquests_manifest.iter().find(|m| &m.name == name).unwrap();
+            if !ftbquests_blob_exists(&client, &entry.hash).await? {
+                println!("Uploading FTB Quests file {}", name);
+                upload_ftbquests_blob(&client, &entry.hash, path).await?;
+            }
+        }
+        upload_ftbquests_manifest(&client, &prefix, &ftbquests_manifest).await?;
     }
 
     if neoforge_changed {
