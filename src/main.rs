@@ -348,6 +348,23 @@ fn main() -> anyhow::Result<()> {
             local_resourcepack_hashes.insert(rel, file_md5(entry.path())?);
         }
 
+        // Some mods (e.g. Continuity) extract their own bundled resourcepacks straight into this
+        // folder as real .zip files. Those never appear in the pack's manifest, so without this
+        // guard the loop below would treat them as "removed" and back them up/strip them from
+        // options.txt on every single sync. Only ever touch files this tool previously placed
+        // here itself, tracked via a local state file — anything else (player's own packs,
+        // mod-injected packs) is left alone regardless of whether it's in the current manifest.
+        let resourcepack_state_path = Path::new(&inst_mc_dir).join(".wolfpacker_resourcepacks.json");
+        let previously_managed: Vec<String> = fs::read_to_string(&resourcepack_state_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let managed_names: std::collections::HashSet<&str> = previously_managed
+            .iter()
+            .map(|s| s.as_str())
+            .chain(resourcepack_manifest.iter().map(|p| p.name.as_str()))
+            .collect();
+
         let resourcepack_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let resourcepack_backup_dir =
             Path::new(&inst_mc_dir).join(format!("resourcepacks_backup_{}", resourcepack_timestamp));
@@ -356,6 +373,10 @@ fn main() -> anyhow::Result<()> {
 
         println!("Backing up outdated and removed resourcepacks...");
         for (name, local_hash) in &local_resourcepack_hashes {
+            if !managed_names.contains(name.as_str()) {
+                continue;
+            }
+
             let up_to_date = resourcepack_manifest
                 .iter()
                 .any(|p| &p.name == name && &p.hash == local_hash);
@@ -404,6 +425,9 @@ fn main() -> anyhow::Result<()> {
             &added_resourcepacks,
             &removed_resourcepacks,
         )?;
+
+        let managed_state: Vec<&str> = resourcepack_manifest.iter().map(|p| p.name.as_str()).collect();
+        fs::write(&resourcepack_state_path, serde_json::to_string(&managed_state)?)?;
     } else {
         println!("No resourcepack manifest published. Skipping resourcepack sync.");
     }
