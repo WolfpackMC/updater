@@ -85,6 +85,14 @@ fn profile_exclude_path(paths: &ModpackPaths) -> PathBuf {
     paths.workdir.join("profile-exclude.json")
 }
 
+/// Substrings matched against rel paths under the instance dir (config/*, options.txt, ...);
+/// a match excludes that file entirely from overrides/mrpack/config-patch scanning. For
+/// server-infra-only files that happen to sit inside the instance dir (e.g. a Velocity proxy
+/// TOML) but aren't part of the modpack itself and must never sync to clients or get diffed.
+fn config_exclude_path(paths: &ModpackPaths) -> PathBuf {
+    paths.workdir.join("config-exclude.json")
+}
+
 /// Local (maintainer-machine-only) snapshot of every pack-managed config key's value as of the
 /// last deploy, used to detect which keys changed this run. Not uploaded anywhere — the
 /// cumulative result of every such diff is what gets published as `config-patch.json`.
@@ -100,6 +108,21 @@ fn load_minimal_excludes(paths: &ModpackPaths) -> anyhow::Result<Vec<String>> {
         Ok(contents) => Ok(serde_json::from_str(&contents)?),
         Err(_) => Ok(Vec::new()),
     }
+}
+
+fn load_config_excludes(paths: &ModpackPaths) -> anyhow::Result<Vec<String>> {
+    match fs::read_to_string(config_exclude_path(paths)) {
+        Ok(contents) => Ok(serde_json::from_str(&contents)?),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Removes any file entry whose rel path matches a config-exclude substring. Returns whether
+/// anything was actually removed, so callers can tell a no-op prune apart from a real change.
+fn prune_excluded(patch: &mut ConfigMap, config_excludes: &[String]) -> bool {
+    let before = patch.len();
+    patch.retain(|rel_path, _| !config_excludes.iter().any(|ex| rel_path.contains(ex.as_str())));
+    patch.len() != before
 }
 
 /* ---------------- MOD SCAN ---------------- */
@@ -305,7 +328,7 @@ struct PacksManifest {
 /// not a denylist: new junk should have to be explicitly opted in, not explicitly excluded.
 const ALLOWED_OVERRIDE_TOP_LEVEL: &[&str] = &["config", "icon.png", "options.txt", "servers.dat"];
 
-fn collect_overrides(paths: &ModpackPaths, server: bool) -> Vec<(String, PathBuf)> {
+fn collect_overrides(paths: &ModpackPaths, server: bool, config_excludes: &[String]) -> Vec<(String, PathBuf)> {
     walkdir::WalkDir::new(&paths.workdir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -319,6 +342,7 @@ fn collect_overrides(paths: &ModpackPaths, server: bool) -> Vec<(String, PathBuf
                 || rel_str.contains(".connector")
                 || rel_str.split('/').any(|p| p == "server")
                 || (server && rel_str.contains(".client"))
+                || config_excludes.iter().any(|ex| rel_str.contains(ex.as_str()))
             {
                 return None;
             }
@@ -790,7 +814,8 @@ async fn main() -> anyhow::Result<()> {
     let ftbquests_changed = ftbquests_manifest != remote_ftbquests_manifest || force;
 
     println!("Scanning config...");
-    let overrides = collect_overrides(&paths, server);
+    let config_excludes = load_config_excludes(&paths)?;
+    let overrides = collect_overrides(&paths, server, &config_excludes);
     let config_files: Vec<(String, PathBuf)> = overrides
         .iter()
         .filter(|(rel, _)| {
@@ -815,7 +840,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
 
     let config_delta = config_patch::diff(&current_config, &baseline_config);
-    let config_changed = !config_delta.is_empty() || force;
+
+    // A file added to config-exclude.json after it was already published still sits in the
+    // remote patch and baseline forever otherwise — the exclude only stops future scanning, it
+    // doesn't retroactively unpublish keys. Prune those out so wolfpacker stops reapplying them.
+    let mut remote_patch: ConfigMap = get_object_text(&client, &format!("{}/config-patch.json", prefix))
+        .await?
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let pruned = prune_excluded(&mut remote_patch, &config_excludes);
+
+    let config_changed = !config_delta.is_empty() || pruned || force;
 
     if !mods_changed && !neoforge_changed && !config_changed && !resourcepacks_changed && !ftbquests_changed {
         println!("No changes. Skipping upload.");
@@ -865,10 +900,6 @@ async fn main() -> anyhow::Result<()> {
         println!("Config changes:");
         config_patch::print_diff(&config_delta, &baseline_config);
         println!("Updating config patch...");
-        let mut remote_patch: ConfigMap = get_object_text(&client, &format!("{}/config-patch.json", prefix))
-            .await?
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
         config_patch::merge(&mut remote_patch, &config_delta);
 
         let body = serde_json::to_string(&remote_patch)?;
