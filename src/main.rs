@@ -1,4 +1,5 @@
 use md5::{Digest, Md5};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::{env, fs, io};
 use std::fs::{rename, File};
@@ -54,6 +55,39 @@ fn file_md5(path: &Path) -> io::Result<String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Walks `dir` and MD5-hashes every file in parallel (rayon, bounded by available cores).
+/// `key_fn` derives the map key (and an arbitrary extra payload, e.g. the ".disabled" flag)
+/// from the path relative to `dir`; returning `None` skips the file.
+fn hash_dir_parallel<T, F>(dir: &Path, key_fn: F) -> anyhow::Result<HashMap<String, (String, T)>>
+where
+    T: Send,
+    F: Fn(String) -> Option<(String, T)> + Sync,
+{
+    let entries: Vec<_> = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .collect();
+
+    entries
+        .par_iter()
+        .filter_map(|entry| {
+            let rel = entry
+                .path()
+                .strip_prefix(dir)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let (key, extra) = key_fn(rel)?;
+            let hash = match file_md5(entry.path()) {
+                Ok(h) => h,
+                Err(e) => return Some(Err(anyhow::anyhow!(e))),
+            };
+            Some(Ok((key, (hash, extra))))
+        })
+        .collect()
 }
 
 fn read_neoforge_version(mmc_pack_path: &Path) -> anyhow::Result<String> {
@@ -148,6 +182,323 @@ fn check_neoforge_version_file(inst_dir: &str, remote_version: &str) -> anyhow::
     Ok(changed)
 }
 
+/// Downloads every `(name, hash)` pair not already present with a matching hash, in parallel
+/// (rayon, bounded by available cores). `url_for` builds the download URL from an entry's hash;
+/// `disk_name_for` builds the on-disk filename from an entry (used to preserve e.g. a mod's
+/// ".disabled" suffix across an update).
+fn download_missing_parallel<'a, T, F, N>(
+    client: &reqwest::blocking::Client,
+    dest_dir: &Path,
+    entries: &'a [T],
+    is_up_to_date: impl Fn(&T) -> bool + Sync,
+    disk_name_for: N,
+    url_for: F,
+) -> anyhow::Result<Vec<&'a T>>
+where
+    T: Sync,
+    F: Fn(&T) -> String + Sync,
+    N: Fn(&T) -> String + Sync,
+{
+    let to_download: Vec<&T> = entries.iter().filter(|e| !is_up_to_date(e)).collect();
+
+    to_download
+        .par_iter()
+        .try_for_each(|entry| -> anyhow::Result<()> {
+            let on_disk_name = disk_name_for(entry);
+            println!("Downloading {}...", on_disk_name);
+            let target_path = dest_dir.join(&on_disk_name);
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let mut response = client.get(url_for(entry)).send()?;
+            let mut out_file = File::create(&target_path)?;
+            io::copy(&mut response, &mut out_file)?;
+            Ok(())
+        })?;
+
+    Ok(to_download)
+}
+
+fn sync_mods(
+    client: &reqwest::blocking::Client,
+    prefix: &str,
+    profile: &str,
+    inst_mc_dir: &str,
+) -> anyhow::Result<()> {
+    println!("Fetching mod manifest...");
+    let full_manifest: Vec<ModEntry> = client
+        .get(format!("{}/{}/manifest.json", CDN_URL, prefix))
+        .send()?
+        .json()?;
+
+    let manifest: Vec<ModEntry> = full_manifest
+        .into_iter()
+        .filter(|m| m.profiles.iter().any(|p| p == &profile))
+        .collect();
+
+    let mods_dir = Path::new(inst_mc_dir).join("mods");
+    fs::create_dir_all(&mods_dir)?;
+
+    println!("Hashing local mods...");
+    // keyed by base name (Prism's ".disabled" suffix stripped), so a disabled mod still
+    // matches its manifest entry instead of being treated as missing/stale.
+    let local_hashes: HashMap<String, (String, bool)> = hash_dir_parallel(&mods_dir, |rel| {
+        let disabled = rel.ends_with(".disabled");
+        let base = rel.strip_suffix(".disabled").unwrap_or(&rel).to_string();
+        Some((base, disabled))
+    })?;
+
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let backup_dir = Path::new(inst_mc_dir).join(format!("mods_backup_{}", timestamp));
+    let mut backup_created = false;
+
+    println!("Backing up outdated and removed mods...");
+    for (base_name, (local_hash, disabled)) in &local_hashes {
+        let up_to_date = manifest
+            .iter()
+            .any(|m| &m.name == base_name && &m.hash == local_hash);
+
+        if !up_to_date {
+            if !backup_created {
+                fs::create_dir_all(&backup_dir)?;
+                backup_created = true;
+            }
+            let on_disk_name = if *disabled {
+                format!("{}.disabled", base_name)
+            } else {
+                base_name.clone()
+            };
+            let src = mods_dir.join(&on_disk_name);
+            let dst = backup_dir.join(&on_disk_name);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            rename(&src, &dst)?;
+        }
+    }
+
+    println!("Downloading new and updated mods...");
+    download_missing_parallel(
+        client,
+        &mods_dir,
+        &manifest,
+        |entry| {
+            local_hashes
+                .get(&entry.name)
+                .map(|(h, _)| h == &entry.hash)
+                .unwrap_or(false)
+        },
+        |entry| {
+            // preserve disabled state across an update instead of silently re-enabling the mod
+            let disabled = local_hashes.get(&entry.name).map(|(_, d)| *d).unwrap_or(false);
+            if disabled {
+                format!("{}.disabled", entry.name)
+            } else {
+                entry.name.clone()
+            }
+        },
+        |entry| format!("{}/mods/{}.jar", CDN_URL, entry.hash),
+    )?;
+
+    Ok(())
+}
+
+fn sync_resourcepacks(
+    client: &reqwest::blocking::Client,
+    prefix: &str,
+    inst_mc_dir: &str,
+) -> anyhow::Result<()> {
+    println!("Fetching resourcepack manifest...");
+    let resourcepack_manifest_res = client
+        .get(format!("{}/{}/resourcepacks-manifest.json", CDN_URL, prefix))
+        .send()?;
+
+    if !resourcepack_manifest_res.status().is_success() {
+        println!("No resourcepack manifest published. Skipping resourcepack sync.");
+        return Ok(());
+    }
+
+    let resourcepack_manifest: Vec<ResourcePackEntry> = resourcepack_manifest_res.json()?;
+
+    let resourcepacks_dir = Path::new(inst_mc_dir).join("resourcepacks");
+    fs::create_dir_all(&resourcepacks_dir)?;
+
+    println!("Hashing local resourcepacks...");
+    let local_resourcepack_hashes: HashMap<String, String> =
+        hash_dir_parallel(&resourcepacks_dir, |rel| Some((rel, ())))?
+            .into_iter()
+            .map(|(k, (hash, ()))| (k, hash))
+            .collect();
+
+    // Some mods (e.g. Continuity) extract their own bundled resourcepacks straight into this
+    // folder as real .zip files. Those never appear in the pack's manifest, so without this
+    // guard the loop below would treat them as "removed" and back them up/strip them from
+    // options.txt on every single sync. Only ever touch files this tool previously placed
+    // here itself, tracked via a local state file — anything else (player's own packs,
+    // mod-injected packs) is left alone regardless of whether it's in the current manifest.
+    let resourcepack_state_path = Path::new(inst_mc_dir).join(".wolfpacker_resourcepacks.json");
+    let previously_managed: Vec<String> = fs::read_to_string(&resourcepack_state_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let managed_names: std::collections::HashSet<&str> = previously_managed
+        .iter()
+        .map(|s| s.as_str())
+        .chain(resourcepack_manifest.iter().map(|p| p.name.as_str()))
+        .collect();
+
+    let resourcepack_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let resourcepack_backup_dir =
+        Path::new(inst_mc_dir).join(format!("resourcepacks_backup_{}", resourcepack_timestamp));
+    let mut resourcepack_backup_created = false;
+    let mut removed_resourcepacks: Vec<String> = Vec::new();
+
+    println!("Backing up outdated and removed resourcepacks...");
+    for (name, local_hash) in &local_resourcepack_hashes {
+        if !managed_names.contains(name.as_str()) {
+            continue;
+        }
+
+        let up_to_date = resourcepack_manifest
+            .iter()
+            .any(|p| &p.name == name && &p.hash == local_hash);
+
+        if !up_to_date {
+            if !resourcepack_backup_created {
+                fs::create_dir_all(&resourcepack_backup_dir)?;
+                resourcepack_backup_created = true;
+            }
+            let src = resourcepacks_dir.join(name);
+            let dst = resourcepack_backup_dir.join(name);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            rename(&src, &dst)?;
+            removed_resourcepacks.push(name.clone());
+        }
+    }
+
+    println!("Downloading new and updated resourcepacks...");
+    let downloaded = download_missing_parallel(
+        client,
+        &resourcepacks_dir,
+        &resourcepack_manifest,
+        |entry| local_resourcepack_hashes.get(&entry.name) == Some(&entry.hash),
+        |entry| entry.name.clone(),
+        |entry| format!("{}/resourcepacks/{}.zip", CDN_URL, entry.hash),
+    )?;
+    let added_resourcepacks: Vec<String> = downloaded.into_iter().map(|e| e.name.clone()).collect();
+
+    // Merge (not overwrite) the enable/disable change into options.txt's resourcePacks list
+    // so a player's own entries and anything other mods register there survive untouched.
+    wolfpacker::config_patch::merge_resource_pack_entries(
+        &Path::new(inst_mc_dir).join("options.txt"),
+        &added_resourcepacks,
+        &removed_resourcepacks,
+    )?;
+
+    let managed_state: Vec<&str> = resourcepack_manifest.iter().map(|p| p.name.as_str()).collect();
+    fs::write(&resourcepack_state_path, serde_json::to_string(&managed_state)?)?;
+
+    Ok(())
+}
+
+fn sync_ftbquests(
+    client: &reqwest::blocking::Client,
+    prefix: &str,
+    inst_mc_dir: &str,
+) -> anyhow::Result<()> {
+    println!("Fetching FTB Quests manifest...");
+    let ftbquests_manifest_res = client
+        .get(format!("{}/{}/ftbquests-manifest.json", CDN_URL, prefix))
+        .send()?;
+
+    if !ftbquests_manifest_res.status().is_success() {
+        println!("No FTB Quests manifest published. Skipping FTB Quests sync.");
+        return Ok(());
+    }
+
+    let ftbquests_manifest: Vec<FtbQuestEntry> = ftbquests_manifest_res.json()?;
+
+    let ftbquests_dir = Path::new(inst_mc_dir).join("config").join("ftbquests");
+    fs::create_dir_all(&ftbquests_dir)?;
+
+    println!("Hashing local FTB Quests files...");
+    let local_ftbquests_hashes: HashMap<String, String> =
+        hash_dir_parallel(&ftbquests_dir, |rel| Some((rel, ())))?
+            .into_iter()
+            .map(|(k, (hash, ()))| (k, hash))
+            .collect();
+
+    let ftbquests_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let ftbquests_backup_dir =
+        Path::new(inst_mc_dir).join(format!("ftbquests_backup_{}", ftbquests_timestamp));
+    let mut ftbquests_backup_created = false;
+
+    println!("Backing up outdated and removed FTB Quests files...");
+    for (name, local_hash) in &local_ftbquests_hashes {
+        let up_to_date = ftbquests_manifest
+            .iter()
+            .any(|q| &q.name == name && &q.hash == local_hash);
+
+        if !up_to_date {
+            if !ftbquests_backup_created {
+                fs::create_dir_all(&ftbquests_backup_dir)?;
+                ftbquests_backup_created = true;
+            }
+            let src = ftbquests_dir.join(name);
+            let dst = ftbquests_backup_dir.join(name);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            rename(&src, &dst)?;
+        }
+    }
+
+    println!("Downloading new and updated FTB Quests files...");
+    download_missing_parallel(
+        client,
+        &ftbquests_dir,
+        &ftbquests_manifest,
+        |entry| local_ftbquests_hashes.get(&entry.name) == Some(&entry.hash),
+        |entry| entry.name.clone(),
+        |entry| format!("{}/ftbquests/{}", CDN_URL, entry.hash),
+    )?;
+
+    Ok(())
+}
+
+fn sync_config_patch(
+    client: &reqwest::blocking::Client,
+    prefix: &str,
+    inst_mc_dir: &str,
+) -> anyhow::Result<()> {
+    println!("Fetching config patch...");
+    match client.get(format!("{}/{}/config-patch.json", CDN_URL, prefix)).send() {
+        Ok(res) if res.status().is_success() => match res.json::<wolfpacker::config_patch::ConfigMap>() {
+            Ok(patch) => {
+                let current_values = wolfpacker::config_patch::read_matching(Path::new(inst_mc_dir), &patch);
+                let effective_diff = wolfpacker::config_patch::diff(&patch, &current_values);
+
+                if effective_diff.is_empty() {
+                    println!("Config already up to date.");
+                } else {
+                    println!("Applying config patch...");
+                    if let Err(e) = wolfpacker::config_patch::apply_all(Path::new(inst_mc_dir), &patch) {
+                        println!("Warning: failed to apply config patch: {}", e);
+                    }
+                }
+            }
+            Err(e) => println!("Warning: malformed config patch, skipping: {}", e),
+        },
+        Ok(_) => println!("No config patch published. Skipping config sync."),
+        Err(e) => println!("Warning: failed to fetch config patch: {}", e),
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let profile = parse_arg("--profile", "all");
     let modpack = parse_arg("--modpack", "wfp");
@@ -155,11 +506,6 @@ fn main() -> anyhow::Result<()> {
     let prefix = format!("{}/{}", modpack, if server { "server" } else { "client" });
     println!("Using profile: {}", profile);
     println!("Modpack: {} ({})", modpack, if server { "server" } else { "client" });
-
-    let inst_name = env::var("INST_NAME").unwrap_or_default();
-    let inst_id = env::var("INST_ID").unwrap_or_default();
-    let inst_java = env::var("INST_JAVA").unwrap_or_default();
-    let inst_java_args = env::var("INST_JAVA_ARGS").unwrap_or_default();
 
     // Outside PrismLauncher (e.g. a Pterodactyl server egg) INST_DIR/INST_MC_DIR aren't set;
     // fall back to the working directory, matching the flat volumes/<uuid> layout.
@@ -230,303 +576,23 @@ fn main() -> anyhow::Result<()> {
         println!("No NeoForge version published. Skipping NeoForge check.");
     }
 
-    println!("Fetching mod manifest...");
-    let full_manifest: Vec<ModEntry> = client
-        .get(format!("{}/{}/manifest.json", CDN_URL, prefix))
-        .send()?
-        .json()?;
+    // The four sync sections below touch disjoint directories/state files (mods/,
+    // resourcepacks/ + options.txt, config/ftbquests/, config/*) and each does its own
+    // network fetch, hashing and downloading — run them concurrently instead of serially.
+    // Each section additionally parallelizes its own hashing/downloads across cores via rayon.
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mods_handle = scope.spawn(|| sync_mods(&client, &prefix, &profile, &inst_mc_dir));
+        let rp_handle = scope.spawn(|| sync_resourcepacks(&client, &prefix, &inst_mc_dir));
+        let ftb_handle = scope.spawn(|| sync_ftbquests(&client, &prefix, &inst_mc_dir));
+        let cfg_handle = scope.spawn(|| sync_config_patch(&client, &prefix, &inst_mc_dir));
 
-    let manifest: Vec<ModEntry> = full_manifest
-        .into_iter()
-        .filter(|m| m.profiles.iter().any(|p| p == &profile))
-        .collect();
+        mods_handle.join().map_err(|_| anyhow::anyhow!("mod sync thread panicked"))??;
+        rp_handle.join().map_err(|_| anyhow::anyhow!("resourcepack sync thread panicked"))??;
+        ftb_handle.join().map_err(|_| anyhow::anyhow!("FTB Quests sync thread panicked"))??;
+        cfg_handle.join().map_err(|_| anyhow::anyhow!("config patch sync thread panicked"))??;
 
-    let mods_dir = Path::new(&inst_mc_dir).join("mods");
-    fs::create_dir_all(&mods_dir)?;
-
-    println!("Hashing local mods...");
-    // keyed by base name (Prism's ".disabled" suffix stripped), so a disabled mod still
-    // matches its manifest entry instead of being treated as missing/stale.
-    let mut local_hashes: HashMap<String, (String, bool)> = HashMap::new();
-    for entry in walkdir::WalkDir::new(&mods_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-    {
-        let rel = entry
-            .path()
-            .strip_prefix(&mods_dir)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let disabled = rel.ends_with(".disabled");
-        let base = rel.strip_suffix(".disabled").unwrap_or(&rel).to_string();
-        local_hashes.insert(base, (file_md5(entry.path())?, disabled));
-    }
-
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let backup_dir = Path::new(&inst_mc_dir).join(format!("mods_backup_{}", timestamp));
-    let mut backup_created = false;
-
-    println!("Backing up outdated and removed mods...");
-    for (base_name, (local_hash, disabled)) in &local_hashes {
-        let up_to_date = manifest
-            .iter()
-            .any(|m| &m.name == base_name && &m.hash == local_hash);
-
-        if !up_to_date {
-            if !backup_created {
-                fs::create_dir_all(&backup_dir)?;
-                backup_created = true;
-            }
-            let on_disk_name = if *disabled {
-                format!("{}.disabled", base_name)
-            } else {
-                base_name.clone()
-            };
-            let src = mods_dir.join(&on_disk_name);
-            let dst = backup_dir.join(&on_disk_name);
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            rename(&src, &dst)?;
-        }
-    }
-
-    println!("Downloading new and updated mods...");
-    for entry in &manifest {
-        let local = local_hashes.get(&entry.name);
-        let up_to_date = local.map(|(h, _)| h == &entry.hash).unwrap_or(false);
-
-        if up_to_date {
-            continue;
-        }
-
-        // preserve disabled state across an update instead of silently re-enabling the mod
-        let disabled = local.map(|(_, d)| *d).unwrap_or(false);
-        let on_disk_name = if disabled {
-            format!("{}.disabled", entry.name)
-        } else {
-            entry.name.clone()
-        };
-
-        println!("Downloading {}...", entry.name);
-        let target_path = mods_dir.join(&on_disk_name);
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut response = client
-            .get(format!("{}/mods/{}.jar", CDN_URL, entry.hash))
-            .send()?;
-        let mut out_file = File::create(&target_path)?;
-        io::copy(&mut response, &mut out_file)?;
-    }
-
-    println!("Fetching resourcepack manifest...");
-    let resourcepack_manifest_res = client
-        .get(format!("{}/{}/resourcepacks-manifest.json", CDN_URL, prefix))
-        .send()?;
-
-    if resourcepack_manifest_res.status().is_success() {
-        let resourcepack_manifest: Vec<ResourcePackEntry> = resourcepack_manifest_res.json()?;
-
-        let resourcepacks_dir = Path::new(&inst_mc_dir).join("resourcepacks");
-        fs::create_dir_all(&resourcepacks_dir)?;
-
-        println!("Hashing local resourcepacks...");
-        let mut local_resourcepack_hashes: HashMap<String, String> = HashMap::new();
-        for entry in walkdir::WalkDir::new(&resourcepacks_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file())
-        {
-            let rel = entry
-                .path()
-                .strip_prefix(&resourcepacks_dir)?
-                .to_string_lossy()
-                .replace('\\', "/");
-            local_resourcepack_hashes.insert(rel, file_md5(entry.path())?);
-        }
-
-        // Some mods (e.g. Continuity) extract their own bundled resourcepacks straight into this
-        // folder as real .zip files. Those never appear in the pack's manifest, so without this
-        // guard the loop below would treat them as "removed" and back them up/strip them from
-        // options.txt on every single sync. Only ever touch files this tool previously placed
-        // here itself, tracked via a local state file — anything else (player's own packs,
-        // mod-injected packs) is left alone regardless of whether it's in the current manifest.
-        let resourcepack_state_path = Path::new(&inst_mc_dir).join(".wolfpacker_resourcepacks.json");
-        let previously_managed: Vec<String> = fs::read_to_string(&resourcepack_state_path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-        let managed_names: std::collections::HashSet<&str> = previously_managed
-            .iter()
-            .map(|s| s.as_str())
-            .chain(resourcepack_manifest.iter().map(|p| p.name.as_str()))
-            .collect();
-
-        let resourcepack_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let resourcepack_backup_dir =
-            Path::new(&inst_mc_dir).join(format!("resourcepacks_backup_{}", resourcepack_timestamp));
-        let mut resourcepack_backup_created = false;
-        let mut removed_resourcepacks: Vec<String> = Vec::new();
-
-        println!("Backing up outdated and removed resourcepacks...");
-        for (name, local_hash) in &local_resourcepack_hashes {
-            if !managed_names.contains(name.as_str()) {
-                continue;
-            }
-
-            let up_to_date = resourcepack_manifest
-                .iter()
-                .any(|p| &p.name == name && &p.hash == local_hash);
-
-            if !up_to_date {
-                if !resourcepack_backup_created {
-                    fs::create_dir_all(&resourcepack_backup_dir)?;
-                    resourcepack_backup_created = true;
-                }
-                let src = resourcepacks_dir.join(name);
-                let dst = resourcepack_backup_dir.join(name);
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                rename(&src, &dst)?;
-                removed_resourcepacks.push(name.clone());
-            }
-        }
-
-        println!("Downloading new and updated resourcepacks...");
-        let mut added_resourcepacks: Vec<String> = Vec::new();
-        for entry in &resourcepack_manifest {
-            let up_to_date = local_resourcepack_hashes.get(&entry.name) == Some(&entry.hash);
-            if up_to_date {
-                continue;
-            }
-
-            println!("Downloading {}...", entry.name);
-            let target_path = resourcepacks_dir.join(&entry.name);
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let mut response = client
-                .get(format!("{}/resourcepacks/{}.zip", CDN_URL, entry.hash))
-                .send()?;
-            let mut out_file = File::create(&target_path)?;
-            io::copy(&mut response, &mut out_file)?;
-            added_resourcepacks.push(entry.name.clone());
-        }
-
-        // Merge (not overwrite) the enable/disable change into options.txt's resourcePacks list
-        // so a player's own entries and anything other mods register there survive untouched.
-        wolfpacker::config_patch::merge_resource_pack_entries(
-            &Path::new(&inst_mc_dir).join("options.txt"),
-            &added_resourcepacks,
-            &removed_resourcepacks,
-        )?;
-
-        let managed_state: Vec<&str> = resourcepack_manifest.iter().map(|p| p.name.as_str()).collect();
-        fs::write(&resourcepack_state_path, serde_json::to_string(&managed_state)?)?;
-    } else {
-        println!("No resourcepack manifest published. Skipping resourcepack sync.");
-    }
-
-    println!("Fetching FTB Quests manifest...");
-    let ftbquests_manifest_res = client
-        .get(format!("{}/{}/ftbquests-manifest.json", CDN_URL, prefix))
-        .send()?;
-
-    if ftbquests_manifest_res.status().is_success() {
-        let ftbquests_manifest: Vec<FtbQuestEntry> = ftbquests_manifest_res.json()?;
-
-        let ftbquests_dir = Path::new(&inst_mc_dir).join("config").join("ftbquests");
-        fs::create_dir_all(&ftbquests_dir)?;
-
-        println!("Hashing local FTB Quests files...");
-        let mut local_ftbquests_hashes: HashMap<String, String> = HashMap::new();
-        for entry in walkdir::WalkDir::new(&ftbquests_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file())
-        {
-            let rel = entry
-                .path()
-                .strip_prefix(&ftbquests_dir)?
-                .to_string_lossy()
-                .replace('\\', "/");
-            local_ftbquests_hashes.insert(rel, file_md5(entry.path())?);
-        }
-
-        let ftbquests_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let ftbquests_backup_dir =
-            Path::new(&inst_mc_dir).join(format!("ftbquests_backup_{}", ftbquests_timestamp));
-        let mut ftbquests_backup_created = false;
-
-        println!("Backing up outdated and removed FTB Quests files...");
-        for (name, local_hash) in &local_ftbquests_hashes {
-            let up_to_date = ftbquests_manifest
-                .iter()
-                .any(|q| &q.name == name && &q.hash == local_hash);
-
-            if !up_to_date {
-                if !ftbquests_backup_created {
-                    fs::create_dir_all(&ftbquests_backup_dir)?;
-                    ftbquests_backup_created = true;
-                }
-                let src = ftbquests_dir.join(name);
-                let dst = ftbquests_backup_dir.join(name);
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                rename(&src, &dst)?;
-            }
-        }
-
-        println!("Downloading new and updated FTB Quests files...");
-        for entry in &ftbquests_manifest {
-            let up_to_date = local_ftbquests_hashes.get(&entry.name) == Some(&entry.hash);
-            if up_to_date {
-                continue;
-            }
-
-            println!("Downloading {}...", entry.name);
-            let target_path = ftbquests_dir.join(&entry.name);
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let mut response = client
-                .get(format!("{}/ftbquests/{}", CDN_URL, entry.hash))
-                .send()?;
-            let mut out_file = File::create(&target_path)?;
-            io::copy(&mut response, &mut out_file)?;
-        }
-    } else {
-        println!("No FTB Quests manifest published. Skipping FTB Quests sync.");
-    }
-
-    println!("Fetching config patch...");
-    match client.get(format!("{}/{}/config-patch.json", CDN_URL, prefix)).send() {
-        Ok(res) if res.status().is_success() => match res.json::<wolfpacker::config_patch::ConfigMap>() {
-            Ok(patch) => {
-                let current_values = wolfpacker::config_patch::read_matching(Path::new(&inst_mc_dir), &patch);
-                let effective_diff = wolfpacker::config_patch::diff(&patch, &current_values);
-
-                if effective_diff.is_empty() {
-                    println!("Config already up to date.");
-                } else {
-                    println!("Applying config patch...");
-                    if let Err(e) = wolfpacker::config_patch::apply_all(Path::new(&inst_mc_dir), &patch) {
-                        println!("Warning: failed to apply config patch: {}", e);
-                    }
-                }
-            }
-            Err(e) => println!("Warning: malformed config patch, skipping: {}", e),
-        },
-        Ok(_) => println!("No config patch published. Skipping config sync."),
-        Err(e) => println!("Warning: failed to fetch config patch: {}", e),
-    }
+        Ok(())
+    })?;
 
     println!("Updating local version file...");
     fs::write(&version_path, remote_version.to_string())?;
