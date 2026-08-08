@@ -80,6 +80,18 @@ fn file_kind(rel_path: &str) -> Option<FileKind> {
     }
 }
 
+/// True if two values should be treated as unchanged. Floats compare with a relative epsilon
+/// since some mods (e.g. attributefix, particular) re-emit their own defaults with 1-ULP text
+/// drift on every launch, which would otherwise flag as a spurious config change on every deploy.
+fn values_equal(a: &ConfigValue, b: &ConfigValue) -> bool {
+    match (a, b) {
+        (ConfigValue::Float(x), ConfigValue::Float(y)) => {
+            (x - y).abs() <= f64::EPSILON * x.abs().max(y.abs()).max(1.0)
+        }
+        _ => a == b,
+    }
+}
+
 /// Keys present (with a different or new value) in `current` but not matching `baseline`.
 pub fn diff(current: &ConfigMap, baseline: &ConfigMap) -> ConfigMap {
     let mut changed = ConfigMap::new();
@@ -87,7 +99,8 @@ pub fn diff(current: &ConfigMap, baseline: &ConfigMap) -> ConfigMap {
     for (file, keys) in current {
         for (key, value) in keys {
             let baseline_value = baseline.get(file).and_then(|m| m.get(key));
-            if baseline_value != Some(value) {
+            let unchanged = baseline_value.is_some_and(|bv| values_equal(bv, value));
+            if !unchanged {
                 changed.entry(file.clone()).or_default().insert(key.clone(), value.clone());
             }
         }

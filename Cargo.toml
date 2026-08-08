@@ -22,3 +22,6 @@ rayon = "1"
 toml = "0.8"
 toml_edit = "0.22"
 
+[build-dependencies]
+embed-resource = "3"
+

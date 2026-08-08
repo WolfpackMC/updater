@@ -820,6 +820,21 @@ async fn main() -> anyhow::Result<()> {
     remote_manifest.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mods_changed = manifest != remote_manifest || force;
+    if mods_changed {
+        let added: Vec<&str> = manifest
+            .iter()
+            .map(|e| e.name.as_str())
+            .filter(|name| !remote_manifest.iter().any(|e| e.name == *name))
+            .collect();
+        let removed: Vec<&str> = remote_manifest
+            .iter()
+            .map(|e| e.name.as_str())
+            .filter(|name| !manifest.iter().any(|e| e.name == *name))
+            .collect();
+        if !added.is_empty() || !removed.is_empty() {
+            println!("Mods added: {:?}, removed: {:?}", added, removed);
+        }
+    }
 
     println!("Checking NeoForge version...");
     let local_neoforge_version = get_local_neoforge_version(&paths)?;
