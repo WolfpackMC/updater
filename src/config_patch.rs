@@ -335,7 +335,7 @@ fn set_json_key(root: &mut serde_json::Value, key_path: &str, value: &ConfigValu
 
 /* ---------------- PROPERTIES ---------------- */
 
-fn extract_properties(text: &str) -> BTreeMap<String, ConfigValue> {
+pub fn extract_properties(text: &str) -> BTreeMap<String, ConfigValue> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -349,8 +349,12 @@ fn extract_properties(text: &str) -> BTreeMap<String, ConfigValue> {
     out
 }
 
-fn apply_properties(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::Result<()> {
-    let text = fs::read_to_string(path).unwrap_or_default();
+/// Overwrites known `key=value` lines in `text` with `keys`, appending any not already present.
+/// Lines that aren't a plain `key=value` pair (comments, `[Section]` headers, blanks) pass
+/// through untouched — this is what lets it double as an instance.cfg patcher (see
+/// `wolfpacker::main`'s memory-allocation sync), since PrismLauncher's INI-style `[General]`
+/// header contains no `=` and is never touched.
+pub fn patch_properties_text(text: &str, keys: &BTreeMap<String, ConfigValue>) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut remaining: BTreeMap<String, String> = keys
         .iter()
@@ -372,10 +376,17 @@ fn apply_properties(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow
         lines.push(format!("{}={}", key, value));
     }
 
+    lines.join("\n") + "\n"
+}
+
+fn apply_properties(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::Result<()> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let patched = patch_properties_text(&text, keys);
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, lines.join("\n") + "\n")?;
+    fs::write(path, patched)?;
     Ok(())
 }
 
@@ -490,8 +501,21 @@ fn apply_options(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::R
 /// leaving every other entry (a player's own packs, vanilla, ids other mods register, ...)
 /// untouched — unlike the generic key=val patching above, this is a merge, not an overwrite,
 /// since `resourcePacks` is a set the pack only partially owns.
-pub fn merge_resource_pack_entries(options_path: &Path, add: &[String], remove: &[String]) -> anyhow::Result<()> {
-    if add.is_empty() && remove.is_empty() {
+///
+/// `order` is the pack maintainer's declared load order for the *managed* entries (from the
+/// source instance's own options.txt), as bare names — e.g. `["Base.zip", "Overlay.zip"]`. Any
+/// name in `order` that isn't currently present locally (not downloaded/enabled) is ignored.
+/// Managed entries are repositioned as a contiguous block to match `order`, anchored at the
+/// index of the first managed entry that was already present; every non-managed entry keeps its
+/// original relative position untouched. An empty `order` skips reordering entirely, so callers
+/// that have no order data (e.g. the source manifest doesn't publish one) leave existing order as-is.
+pub fn merge_resource_pack_entries(
+    options_path: &Path,
+    add: &[String],
+    remove: &[String],
+    order: &[String],
+) -> anyhow::Result<()> {
+    if add.is_empty() && remove.is_empty() && order.is_empty() {
         return Ok(());
     }
 
@@ -512,6 +536,33 @@ pub fn merge_resource_pack_entries(options_path: &Path, add: &[String], remove: 
         if !packs.contains(&entry) {
             packs.push(entry);
         }
+    }
+
+    if !order.is_empty() {
+        let order_set: std::collections::HashSet<&str> = order.iter().map(|s| s.as_str()).collect();
+        let is_managed = |p: &str| p.strip_prefix("file/").map(|n| order_set.contains(n)).unwrap_or(false);
+
+        let anchor = packs.iter().position(|p| is_managed(p)).map(|idx| {
+            packs[..idx].iter().filter(|p| !is_managed(p)).count()
+        });
+
+        let present_managed: std::collections::HashSet<&str> = packs
+            .iter()
+            .filter_map(|p| p.strip_prefix("file/"))
+            .filter(|n| order_set.contains(n))
+            .collect();
+        let reordered_managed: Vec<String> = order
+            .iter()
+            .filter(|n| present_managed.contains(n.as_str()))
+            .map(|n| format!("file/{}", n))
+            .collect();
+
+        let mut new_packs: Vec<String> = packs.iter().filter(|p| !is_managed(p)).cloned().collect();
+        let insert_at = anchor.unwrap_or(new_packs.len());
+        for (i, entry) in reordered_managed.into_iter().enumerate() {
+            new_packs.insert((insert_at + i).min(new_packs.len()), entry);
+        }
+        packs = new_packs;
     }
 
     let new_line = format!("resourcePacks:{}", serde_json::to_string(&packs)?);

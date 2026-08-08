@@ -1,6 +1,6 @@
 use md5::{Digest, Md5};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::{env, fs, io};
 use std::fs::{rename, File};
 use std::io::Read;
@@ -166,6 +166,57 @@ fn update_neoforge_version(inst_dir: &str, remote_version: &str) -> anyhow::Resu
         remote_version,
         MAX_ATTEMPTS
     )
+}
+
+// PrismLauncher-only (dedicated servers have no instance.cfg/launcher and set heap/JVM args via
+// their own start script/egg config). Patched in place with `config_patch::patch_properties_text`,
+// the same key=value patcher `config-patch.json` uses for .properties files — instance.cfg's
+// `[General]` header has no `=`, so it (and every other line we don't own) passes through
+// untouched. This only takes effect on the *next* launch: PrismLauncher reads instance.cfg to
+// build the JVM's args before this pre-launch command ever runs, so a change made here can't
+// affect the game process about to start.
+//
+// Each setting group needs its own `Override*` flag flipped on for PrismLauncher to actually use
+// the value instead of its own default/inherited one, so only flip the flag for a group whose
+// keys are actually present in `remote` — an empty `JvmArgs` upstream (nothing published) must
+// not force `OverrideJavaArgs=true` and blank out a player's own custom args.
+fn update_launch_settings(inst_dir: &str, remote: &BTreeMap<String, String>) -> anyhow::Result<bool> {
+    if remote.is_empty() {
+        return Ok(false);
+    }
+
+    let cfg_path = Path::new(inst_dir).join("instance.cfg");
+    let text = fs::read_to_string(&cfg_path).unwrap_or_default();
+    let current = wolfpacker::config_patch::extract_properties(&text);
+
+    let up_to_date = remote.iter().all(|(k, v)| {
+        current.get(k).map(|cv| &cv.to_string() == v).unwrap_or(false)
+    });
+    if up_to_date {
+        return Ok(false);
+    }
+
+    let mut patch: BTreeMap<String, wolfpacker::config_patch::ConfigValue> = remote
+        .iter()
+        .map(|(k, v)| (k.clone(), wolfpacker::config_patch::ConfigValue::String(v.clone())))
+        .collect();
+    if remote.contains_key("MinMemAlloc") || remote.contains_key("MaxMemAlloc") {
+        patch.insert(
+            "OverrideMemory".to_string(),
+            wolfpacker::config_patch::ConfigValue::String("true".to_string()),
+        );
+    }
+    if remote.contains_key("JvmArgs") {
+        patch.insert(
+            "OverrideJavaArgs".to_string(),
+            wolfpacker::config_patch::ConfigValue::String("true".to_string()),
+        );
+    }
+
+    let patched = wolfpacker::config_patch::patch_properties_text(&text, &patch);
+    fs::write(&cfg_path, patched)?;
+
+    Ok(true)
 }
 
 // Server variant has no mmc-pack.json (no PrismLauncher) and no automated loader install here —
@@ -390,12 +441,24 @@ fn sync_resourcepacks(
     )?;
     let added_resourcepacks: Vec<String> = downloaded.into_iter().map(|e| e.name.clone()).collect();
 
+    // Optional: the pack maintainer's declared load order for managed resourcepacks (from the
+    // source instance's own options.txt). Absent/404 just means no order data was published —
+    // skip reordering and leave whatever order the player already has.
+    let order: Vec<String> = client
+        .get(format!("{}/{}/resourcepacks-order.json", CDN_URL, prefix))
+        .send()
+        .ok()
+        .filter(|res| res.status().is_success())
+        .and_then(|res| res.json().ok())
+        .unwrap_or_default();
+
     // Merge (not overwrite) the enable/disable change into options.txt's resourcePacks list
     // so a player's own entries and anything other mods register there survive untouched.
     wolfpacker::config_patch::merge_resource_pack_entries(
         &Path::new(inst_mc_dir).join("options.txt"),
         &added_resourcepacks,
         &removed_resourcepacks,
+        &order,
     )?;
 
     let managed_state: Vec<&str> = resourcepack_manifest.iter().map(|p| p.name.as_str()).collect();
@@ -574,6 +637,21 @@ fn main() -> anyhow::Result<()> {
         }
     } else {
         println!("No NeoForge version published. Skipping NeoForge check.");
+    }
+
+    if !server {
+        println!("Checking launch settings (memory, JVM args)...");
+        let launch_res = client.get(format!("{}/{}/launch-settings.json", CDN_URL, prefix)).send()?;
+        if launch_res.status().is_success() {
+            let remote_launch_settings: BTreeMap<String, String> = launch_res.json().unwrap_or_default();
+            if update_launch_settings(&inst_dir, &remote_launch_settings)? {
+                println!("Updated launch settings to {:?} (takes effect next launch)", remote_launch_settings);
+            } else {
+                println!("Launch settings are already up to date.");
+            }
+        } else {
+            println!("No launch settings published. Skipping launch settings check.");
+        }
     }
 
     // The four sync sections below touch disjoint directories/state files (mods/,

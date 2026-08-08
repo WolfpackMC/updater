@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::Sha512;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -589,6 +590,36 @@ async fn upload_resourcepack_manifest(
     put_object_text(client, &format!("{}/resourcepacks-manifest.json", prefix), body, "application/json").await
 }
 
+/// Reads the source instance's own `resourcePacks` list and returns the managed entries (those
+/// present in `manifest`) in the maintainer's declared load order, as bare names. Anything else
+/// in that list (a maintainer's own test packs, vanilla ids, ...) is ignored — this only exists
+/// to carry *order* for entries wolfpacker already manages, not to expand what it manages.
+fn read_source_resourcepack_order(paths: &ModpackPaths, manifest: &[ResourcePackEntry]) -> Vec<String> {
+    let managed: std::collections::HashSet<&str> = manifest.iter().map(|e| e.name.as_str()).collect();
+
+    let text = fs::read_to_string(paths.workdir.join("options.txt")).unwrap_or_default();
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("resourcePacks:"))
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| entry.strip_prefix("file/").map(|n| n.to_string()))
+        .filter(|n| managed.contains(n.as_str()))
+        .collect()
+}
+
+async fn get_remote_resourcepack_order(client: &Client, prefix: &str) -> anyhow::Result<Vec<String>> {
+    match get_object_text(client, &format!("{}/resourcepacks-order.json", prefix)).await? {
+        Some(text) => Ok(serde_json::from_str(&text).unwrap_or_default()),
+        None => Ok(Vec::new()),
+    }
+}
+
+async fn upload_resourcepack_order(client: &Client, prefix: &str, order: &[String]) -> anyhow::Result<()> {
+    let body = serde_json::to_string(order)?;
+    put_object_text(client, &format!("{}/resourcepacks-order.json", prefix), body, "application/json").await
+}
+
 async fn resourcepack_blob_exists(client: &Client, hash: &str) -> anyhow::Result<bool> {
     match client
         .head_object()
@@ -701,6 +732,37 @@ async fn upload_neoforge_version(client: &Client, prefix: &str, version: &str) -
     put_object_text(client, &format!("{}/neoforge-version", prefix), version.to_string(), "text/plain").await
 }
 
+/* ---------------- LAUNCH SETTINGS (memory, JVM args) ---------------- */
+
+/// PrismLauncher-only settings — dedicated servers have no instance.cfg/launcher and set these
+/// via their own start script/egg config, so this is never read for `--server` deploys.
+const LAUNCH_KEYS: &[&str] = &["MinMemAlloc", "MaxMemAlloc", "JvmArgs"];
+
+fn instance_cfg_path(paths: &ModpackPaths) -> PathBuf {
+    paths.instance_dir.join("instance.cfg")
+}
+
+fn get_local_launch_settings(paths: &ModpackPaths) -> BTreeMap<String, String> {
+    let text = fs::read_to_string(instance_cfg_path(paths)).unwrap_or_default();
+    let all = config_patch::extract_properties(&text);
+    LAUNCH_KEYS
+        .iter()
+        .filter_map(|k| all.get(*k).map(|v| (k.to_string(), v.to_string())))
+        .collect()
+}
+
+async fn get_remote_launch_settings(client: &Client, prefix: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    Ok(get_object_text(client, &format!("{}/launch-settings.json", prefix))
+        .await?
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default())
+}
+
+async fn upload_launch_settings(client: &Client, prefix: &str, settings: &BTreeMap<String, String>) -> anyhow::Result<()> {
+    let body = serde_json::to_string(settings)?;
+    put_object_text(client, &format!("{}/launch-settings.json", prefix), body, "application/json").await
+}
+
 /* ---------------- ARGS ---------------- */
 
 fn parse_arg(flag: &str, default: &str) -> String {
@@ -768,6 +830,11 @@ async fn main() -> anyhow::Result<()> {
 
     let neoforge_changed = Some(local_neoforge_version.clone()) != remote_neoforge_version || force;
 
+    // Client-only, same reasoning as resourcepacks above.
+    let local_launch_settings = if server { BTreeMap::new() } else { get_local_launch_settings(&paths) };
+    let remote_launch_settings = if server { BTreeMap::new() } else { get_remote_launch_settings(&client, &prefix).await? };
+    let launch_settings_changed = !server && (local_launch_settings != remote_launch_settings || force);
+
     // Client-only: the dedicated server doesn't render anything, so resourcepacks are never
     // scanned/published for `--server` runs.
     let resourcepacks: Vec<(String, PathBuf)> = if server { Vec::new() } else { collect_resourcepacks(&paths) };
@@ -782,6 +849,22 @@ async fn main() -> anyhow::Result<()> {
     remote_resourcepack_manifest.sort_by(|a, b| a.name.cmp(&b.name));
 
     let resourcepacks_changed = resourcepack_manifest != remote_resourcepack_manifest || (force && !server);
+
+    // Load order (not just enable/disable) is read from the source instance's own options.txt
+    // and published separately from the content-addressed manifest above, so this maintainer's
+    // declared order can reach clients too — see config_patch::merge_resource_pack_entries for
+    // how it's merged in without disturbing a player's own entries.
+    let resourcepack_order: Vec<String> = if server {
+        Vec::new()
+    } else {
+        read_source_resourcepack_order(&paths, &resourcepack_manifest)
+    };
+    let remote_resourcepack_order = if server {
+        Vec::new()
+    } else {
+        get_remote_resourcepack_order(&client, &prefix).await?
+    };
+    let resourcepack_order_changed = resourcepack_order != remote_resourcepack_order || (force && !server);
 
     // Enabling/disabling in each player's own options.txt happens client-side, driven by what
     // wolfpacker actually adds/removes from their resourcepacks folder — see
@@ -852,7 +935,14 @@ async fn main() -> anyhow::Result<()> {
 
     let config_changed = !config_delta.is_empty() || pruned || force;
 
-    if !mods_changed && !neoforge_changed && !config_changed && !resourcepacks_changed && !ftbquests_changed {
+    if !mods_changed
+        && !neoforge_changed
+        && !config_changed
+        && !resourcepacks_changed
+        && !resourcepack_order_changed
+        && !ftbquests_changed
+        && !launch_settings_changed
+    {
         println!("No changes. Skipping upload.");
         return Ok(());
     }
@@ -881,6 +971,10 @@ async fn main() -> anyhow::Result<()> {
         upload_resourcepack_manifest(&client, &prefix, &resourcepack_manifest).await?;
     }
 
+    if resourcepack_order_changed {
+        upload_resourcepack_order(&client, &prefix, &resourcepack_order).await?;
+    }
+
     if ftbquests_changed {
         for (name, path) in &ftbquests {
             let entry = ftbquests_manifest.iter().find(|m| &m.name == name).unwrap();
@@ -894,6 +988,10 @@ async fn main() -> anyhow::Result<()> {
 
     if neoforge_changed {
         upload_neoforge_version(&client, &prefix, &local_neoforge_version).await?;
+    }
+
+    if launch_settings_changed {
+        upload_launch_settings(&client, &prefix, &local_launch_settings).await?;
     }
 
     if config_changed {
