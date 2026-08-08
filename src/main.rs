@@ -189,18 +189,30 @@ fn update_launch_settings(inst_dir: &str, remote: &BTreeMap<String, String>) -> 
     let text = fs::read_to_string(&cfg_path).unwrap_or_default();
     let current = wolfpacker::config_patch::extract_properties(&text);
 
-    let up_to_date = remote.iter().all(|(k, v)| {
+    // A player who's bumped MaxMemAlloc above the pack's default has a reason to (more RAM to
+    // spare) — never clamp them back down to the published value, only ever raise it.
+    let mut effective = remote.clone();
+    if let (Some(remote_max), Some(current_max)) = (
+        remote.get("MaxMemAlloc").and_then(|v| v.parse::<i64>().ok()),
+        current.get("MaxMemAlloc").map(|v| v.to_string()).and_then(|v| v.parse::<i64>().ok()),
+    ) {
+        if current_max > remote_max {
+            effective.remove("MaxMemAlloc");
+        }
+    }
+
+    let up_to_date = effective.iter().all(|(k, v)| {
         current.get(k).map(|cv| &cv.to_string() == v).unwrap_or(false)
     });
     if up_to_date {
         return Ok(false);
     }
 
-    let mut patch: BTreeMap<String, wolfpacker::config_patch::ConfigValue> = remote
+    let mut patch: BTreeMap<String, wolfpacker::config_patch::ConfigValue> = effective
         .iter()
         .map(|(k, v)| (k.clone(), wolfpacker::config_patch::ConfigValue::String(v.clone())))
         .collect();
-    if remote.contains_key("MinMemAlloc") || remote.contains_key("MaxMemAlloc") {
+    if effective.contains_key("MinMemAlloc") || effective.contains_key("MaxMemAlloc") {
         patch.insert(
             "OverrideMemory".to_string(),
             wolfpacker::config_patch::ConfigValue::String("true".to_string()),
