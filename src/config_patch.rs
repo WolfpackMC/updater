@@ -178,13 +178,26 @@ pub fn print_diff(delta: &ConfigMap, old: &ConfigMap) {
     }
 }
 
+/// (rel_path, dotted key) pairs that are seeded once and then left alone forever after, instead
+/// of the default "pack always wins" behavior — for settings that are a personal hardware/
+/// performance preference (e.g. Distant Horizons' CPU thread usage) rather than pack content the
+/// maintainer should keep re-forcing on every sync. Same semantics as `SEEDED_OPTIONS_PREFIX`
+/// below: applied unconditionally the first time (even overwriting a value the player already
+/// set), then skipped forever once the player's local value no longer matches what was last seeded.
+const SEEDED_TOML_KEYS: &[(&str, &str)] = &[
+    ("config/DistantHorizons.toml", "common.multiThreading.numberOfThreads"),
+    ("config/DistantHorizons.toml", "common.multiThreading.threadRunTimeRatio"),
+    ("config/DistantHorizons.toml", "common.multiThreading.threadPriority"),
+];
+
 /// Applies a patch under `config_dir_root` (the dir containing `config/...`, i.e. the instance
-/// minecraft dir). Pack values always win over whatever the player has in that key.
+/// minecraft dir). Pack values always win over whatever the player has in that key, except for
+/// `SEEDED_TOML_KEYS` entries, which are seed-once (see its docs).
 pub fn apply_all(config_dir_root: &Path, patch: &ConfigMap) -> anyhow::Result<()> {
     for (rel_path, keys) in patch {
         let path = config_dir_root.join(rel_path);
         match file_kind(rel_path) {
-            Some(FileKind::Toml) => apply_toml(&path, keys)?,
+            Some(FileKind::Toml) => apply_toml(rel_path, &path, keys)?,
             Some(FileKind::Json) => apply_json(&path, keys)?,
             Some(FileKind::Properties) => apply_properties(&path, keys)?,
             Some(FileKind::Options) => apply_options(&path, keys)?,
@@ -230,12 +243,41 @@ fn flatten_toml(value: &toml::Value, prefix: &str, out: &mut BTreeMap<String, Co
     }
 }
 
-fn apply_toml(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::Result<()> {
+fn apply_toml(rel_path: &str, path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut doc = text.parse::<toml_edit::DocumentMut>().unwrap_or_else(|_| toml_edit::DocumentMut::new());
+    let current_all = extract_toml(&text);
+
+    let seed_state_path = path.with_file_name(format!(
+        ".{}.wolfpacker-seed-state.json",
+        path.file_name().and_then(|f| f.to_str()).unwrap_or("config")
+    ));
+    let mut seed_state: BTreeMap<String, String> = fs::read_to_string(&seed_state_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut seed_state_changed = false;
 
     for (key_path, value) in keys {
+        if SEEDED_TOML_KEYS.contains(&(rel_path, key_path.as_str())) {
+            // Diverged = local value exists and no longer matches what we last seeded, meaning
+            // the player changed it since. Absent from either side just means "never touched by
+            // us or the player" — safe to seed.
+            let diverged = match (current_all.get(key_path), seed_state.get(key_path)) {
+                (Some(local), Some(last_seeded)) => &local.to_string() != last_seeded,
+                _ => false,
+            };
+            if diverged {
+                continue;
+            }
+            seed_state.insert(key_path.clone(), value.to_string());
+            seed_state_changed = true;
+        }
         set_toml_key(doc.as_table_mut(), key_path, value);
+    }
+
+    if seed_state_changed {
+        fs::write(&seed_state_path, serde_json::to_string(&seed_state)?)?;
     }
 
     if let Some(parent) = path.parent() {
