@@ -443,7 +443,7 @@ fn sync_resourcepacks(
     }
 
     println!("Downloading new and updated resourcepacks...");
-    let downloaded = download_missing_parallel(
+    download_missing_parallel(
         client,
         &resourcepacks_dir,
         &resourcepack_manifest,
@@ -451,7 +451,10 @@ fn sync_resourcepacks(
         |entry| entry.name.clone(),
         |entry| format!("{}/resourcepacks/{}.zip", CDN_URL, entry.hash),
     )?;
-    let added_resourcepacks: Vec<String> = downloaded.into_iter().map(|e| e.name.clone()).collect();
+    // Every managed pack is force-added (not just newly downloaded ones) so a player-disabled
+    // pack gets re-enabled on every sync, not only when its content happens to change.
+    let added_resourcepacks: Vec<String> =
+        resourcepack_manifest.iter().map(|e| e.name.clone()).collect();
 
     // Optional: the pack maintainer's declared load order for managed resourcepacks (from the
     // source instance's own options.txt). Absent/404 just means no order data was published —

@@ -184,7 +184,19 @@ pub fn print_diff(delta: &ConfigMap, old: &ConfigMap) {
 /// maintainer should keep re-forcing on every sync. Same semantics as `SEEDED_OPTIONS_PREFIX`
 /// below: applied unconditionally the first time (even overwriting a value the player already
 /// set), then skipped forever once the player's local value no longer matches what was last seeded.
-const SEEDED_TOML_KEYS: &[(&str, &str)] = &[
+const SEEDED_TOML_KEYS: &[(&str, &str)] = &[];
+
+/// Same (rel_path, dotted key) shape as `SEEDED_TOML_KEYS`, but for a one-time reseed: applied
+/// unconditionally this sync (even overriding a player's already-diverged local value), then the
+/// local seed-state baseline is reset to the newly-applied value — so the very next sync, if the
+/// key is moved back to `SEEDED_TOML_KEYS`, sees no divergence yet and quietly resumes normal
+/// seed-once behavior instead of re-forcing. Move entries here for exactly one deploy, then move
+/// them back to `SEEDED_TOML_KEYS` before the following deploy.
+///
+/// 2026-08-09: DH CPU-load thread settings switched to the "Minimal Impact" preset
+/// (numberOfThreads/threadRunTimeRatio); force-reseeding once so players who'd already diverged
+/// still pick up the new baseline, then back to seed-once next release.
+const FORCE_RESEED_TOML_KEYS: &[(&str, &str)] = &[
     ("config/DistantHorizons.toml", "common.multiThreading.numberOfThreads"),
     ("config/DistantHorizons.toml", "common.multiThreading.threadRunTimeRatio"),
     ("config/DistantHorizons.toml", "common.multiThreading.threadPriority"),
@@ -259,16 +271,19 @@ fn apply_toml(rel_path: &str, path: &Path, keys: &BTreeMap<String, ConfigValue>)
     let mut seed_state_changed = false;
 
     for (key_path, value) in keys {
-        if SEEDED_TOML_KEYS.contains(&(rel_path, key_path.as_str())) {
-            // Diverged = local value exists and no longer matches what we last seeded, meaning
-            // the player changed it since. Absent from either side just means "never touched by
-            // us or the player" — safe to seed.
-            let diverged = match (current_all.get(key_path), seed_state.get(key_path)) {
-                (Some(local), Some(last_seeded)) => &local.to_string() != last_seeded,
-                _ => false,
-            };
-            if diverged {
-                continue;
+        let force_reseed = FORCE_RESEED_TOML_KEYS.contains(&(rel_path, key_path.as_str()));
+        if force_reseed || SEEDED_TOML_KEYS.contains(&(rel_path, key_path.as_str())) {
+            if !force_reseed {
+                // Diverged = local value exists and no longer matches what we last seeded, meaning
+                // the player changed it since. Absent from either side just means "never touched by
+                // us or the player" — safe to seed.
+                let diverged = match (current_all.get(key_path), seed_state.get(key_path)) {
+                    (Some(local), Some(last_seeded)) => &local.to_string() != last_seeded,
+                    _ => false,
+                };
+                if diverged {
+                    continue;
+                }
             }
             seed_state.insert(key_path.clone(), value.to_string());
             seed_state_changed = true;
