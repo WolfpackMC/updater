@@ -234,10 +234,18 @@ const CLIENT_OWNED_FILES: &[&str] = &[
     "config/xaero/world-map/client.cfg",
 ];
 
+/// (rel_path, dotted key) pairs that stay pack-forced (applied every sync, overwriting whatever
+/// the client has) even inside a `CLIENT_OWNED_FILES` file — carve-outs for the rare key in an
+/// otherwise client-owned file that's actually security-relevant rather than a preference. CPM's
+/// `globalSettings.safetyProfile` gates whether custom player models can run arbitrary
+/// animations/scripts; leaving it client-owned would let a player (or a malicious model prompting
+/// them to) silently disable that protection.
+const ALWAYS_FORCED_KEYS: &[(&str, &str)] = &[("config/cpm.json", "globalSettings.safetyProfile")];
+
 /// Applies a patch under `config_dir_root` (the dir containing `config/...`, i.e. the instance
 /// minecraft dir). Pack values always win over whatever the player has in that key, except for
 /// `SEEDED_TOML_KEYS` entries (seed-once, see its docs) and `CLIENT_OWNED_FILES` entries (set
-/// only if absent, see its docs).
+/// only if absent, see its docs) — `ALWAYS_FORCED_KEYS` overrides the latter back to pack-wins.
 pub fn apply_all(config_dir_root: &Path, patch: &ConfigMap) -> anyhow::Result<()> {
     for (rel_path, keys) in patch {
         let path = config_dir_root.join(rel_path);
@@ -254,7 +262,10 @@ pub fn apply_all(config_dir_root: &Path, patch: &ConfigMap) -> anyhow::Result<()
             };
             owned_keys = keys
                 .iter()
-                .filter(|(k, _)| !current.contains_key(*k))
+                .filter(|(k, _)| {
+                    ALWAYS_FORCED_KEYS.contains(&(rel_path.as_str(), k.as_str()))
+                        || !current.contains_key(*k)
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<BTreeMap<_, _>>();
             &owned_keys
