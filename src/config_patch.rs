@@ -58,19 +58,31 @@ pub fn extract_all(files: &[(String, PathBuf)]) -> ConfigMap {
     map
 }
 
-enum FileKind {
+#[derive(Clone, Copy)]
+pub enum FileKind {
     Toml,
     Json,
     Properties,
     Options,
 }
 
+/// `.cfg` files that use plain `key = value` lines, matched by full relative path since the
+/// `.cfg` extension alone doesn't distinguish them from Forge's own `.cfg` format (categories of
+/// `K:"name"=val`, e.g. `EnderStorage.cfg`), which isn't handled by any parser here.
+const PROPERTIES_STYLE_CFG_FILES: &[&str] = &[
+    "config/xaero/minimap/client.cfg",
+    "config/xaero/world-map/client.cfg",
+];
+
 /// Classifies a pack-managed config path by how it should be parsed/patched. `options.txt`
 /// (Minecraft's own `key:value` file, sitting at the instance root rather than under `config/`)
-/// is matched by name, not extension.
-fn file_kind(rel_path: &str) -> Option<FileKind> {
+/// and the `PROPERTIES_STYLE_CFG_FILES` are matched by name, not extension.
+pub fn file_kind(rel_path: &str) -> Option<FileKind> {
     if Path::new(rel_path).file_name().and_then(|f| f.to_str()) == Some("options.txt") {
         return Some(FileKind::Options);
+    }
+    if PROPERTIES_STYLE_CFG_FILES.contains(&rel_path) {
+        return Some(FileKind::Properties);
     }
     match Path::new(rel_path).extension().and_then(|e| e.to_str()) {
         Some("toml") => Some(FileKind::Toml),
@@ -202,18 +214,59 @@ const FORCE_RESEED_TOML_KEYS: &[(&str, &str)] = &[
     ("config/DistantHorizons.toml", "common.multiThreading.threadPriority"),
 ];
 
+/// `rel_path`s whose tracked keys are only ever set if entirely absent locally — never
+/// overwritten, not even once. Unlike `SEEDED_TOML_KEYS`/`SEEDED_OPTIONS_PREFIX` (which
+/// force-apply the pack's value the first time and only defer to the player once they've
+/// diverged from it), these files are generated and fully owned by the client/mod itself
+/// (rendering/perf toggles, UI preferences, per-player profiles) — by the time wolfpacker ever
+/// sees the file, a tracked key is already "client-set", so there's no window where forcing the
+/// pack's value is correct. Only fills in a key that genuinely doesn't exist yet (file missing,
+/// or a new key the client hasn't written).
+const CLIENT_OWNED_FILES: &[&str] = &[
+    "config/sodium-options.json",
+    "config/sodium-extra-options.json",
+    "config/entityculling.json",
+    "config/immediatelyfast.json",
+    "config/tectonic.json",
+    "config/iris-excluded.json",
+    "config/cpm.json",
+    "config/xaero/minimap/client.cfg",
+    "config/xaero/world-map/client.cfg",
+];
+
 /// Applies a patch under `config_dir_root` (the dir containing `config/...`, i.e. the instance
 /// minecraft dir). Pack values always win over whatever the player has in that key, except for
-/// `SEEDED_TOML_KEYS` entries, which are seed-once (see its docs).
+/// `SEEDED_TOML_KEYS` entries (seed-once, see its docs) and `CLIENT_OWNED_FILES` entries (set
+/// only if absent, see its docs).
 pub fn apply_all(config_dir_root: &Path, patch: &ConfigMap) -> anyhow::Result<()> {
     for (rel_path, keys) in patch {
         let path = config_dir_root.join(rel_path);
-        match file_kind(rel_path) {
-            Some(FileKind::Toml) => apply_toml(rel_path, &path, keys)?,
-            Some(FileKind::Json) => apply_json(rel_path, &path, keys)?,
-            Some(FileKind::Properties) => apply_properties(&path, keys)?,
-            Some(FileKind::Options) => apply_options(&path, keys)?,
-            None => {}
+        let Some(kind) = file_kind(rel_path) else { continue };
+
+        let owned_keys;
+        let keys = if CLIENT_OWNED_FILES.contains(&rel_path.as_str()) {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let current = match kind {
+                FileKind::Toml => extract_toml(&text),
+                FileKind::Json => extract_json(&text),
+                FileKind::Properties => extract_properties(&text),
+                FileKind::Options => extract_options(&text),
+            };
+            owned_keys = keys
+                .iter()
+                .filter(|(k, _)| !current.contains_key(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<BTreeMap<_, _>>();
+            &owned_keys
+        } else {
+            keys
+        };
+
+        match kind {
+            FileKind::Toml => apply_toml(rel_path, &path, keys)?,
+            FileKind::Json => apply_json(&path, keys)?,
+            FileKind::Properties => apply_properties(&path, keys)?,
+            FileKind::Options => apply_options(&path, keys)?,
         }
     }
 
@@ -359,30 +412,12 @@ fn flatten_json(value: &serde_json::Value, prefix: &str, out: &mut BTreeMap<Stri
     }
 }
 
-/// `rel_path`s whose JSON keys are only ever set if entirely absent locally — never overwritten,
-/// not even once. Unlike `SEEDED_TOML_KEYS`/`SEEDED_OPTIONS_PREFIX` (which force-apply the pack's
-/// value the first time and only defer to the player once they've diverged from it), these files
-/// are generated by the client itself (e.g. Sodium writes its own defaults to `sodium-options.json`
-/// on first launch) — by the time wolfpacker ever sees the file, the key is already "client-set",
-/// so there's no window where forcing the pack's value is correct. Only fills in a key that
-/// genuinely doesn't exist yet (file missing, or a new key the client hasn't written).
-const CLIENT_OWNED_JSON_FILES: &[&str] = &[
-    "config/sodium-options.json",
-    "config/sodium-extra-options.json",
-];
-
-fn apply_json(rel_path: &str, path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::Result<()> {
+fn apply_json(path: &Path, keys: &BTreeMap<String, ConfigValue>) -> anyhow::Result<()> {
     let text = fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
     let mut root: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}));
 
-    let client_owned = CLIENT_OWNED_JSON_FILES.contains(&rel_path);
-    let current_all = if client_owned { extract_json(&text) } else { BTreeMap::new() };
-
     for (key_path, value) in keys {
-        if client_owned && current_all.contains_key(key_path) {
-            continue;
-        }
         set_json_key(&mut root, key_path, value);
     }
 

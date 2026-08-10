@@ -919,13 +919,9 @@ async fn main() -> anyhow::Result<()> {
         .filter(|(rel, _)| {
             // `config/ftbquests/**` ships whole-file via the ftbquests manifest above, not via
             // scalar key=val patching — tracking it here too would double-manage the same files.
-            rel.as_str() == "options.txt"
-                || (rel.starts_with("config/")
-                    && !rel.starts_with("config/ftbquests/")
-                    && matches!(
-                        Path::new(rel).extension().and_then(|e| e.to_str()),
-                        Some("toml") | Some("json") | Some("properties")
-                    ))
+            (rel.as_str() == "options.txt" || rel.starts_with("config/"))
+                && !rel.starts_with("config/ftbquests/")
+                && config_patch::file_kind(rel).is_some()
         })
         .cloned()
         .collect();
