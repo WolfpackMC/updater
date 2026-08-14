@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CDN_URL: &str = "https://wolfpack-cdn.kalkafox.dev";
+const CDN_URL: &str = "https://wolfpackmc.s3.us-east-1.amazonaws.com";
 
 #[derive(serde::Deserialize)]
 struct ModEntry {
