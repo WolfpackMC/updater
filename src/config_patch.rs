@@ -225,14 +225,30 @@ const FORCE_RESEED_TOML_KEYS: &[(&str, &str)] = &[
 const CLIENT_OWNED_FILES: &[&str] = &[
     "config/sodium-options.json",
     "config/sodium-extra-options.json",
+    "config/sodium-fingerprint.json",
     "config/entityculling.json",
     "config/immediatelyfast.json",
     "config/tectonic.json",
     "config/iris-excluded.json",
     "config/cpm.json",
+    "config/moreculling.toml",
     "config/xaero/minimap/client.cfg",
     "config/xaero/world-map/client.cfg",
+    "config/xaero/minimap/default_radar_categories_client.json",
 ];
+
+/// True for any `-client.toml`/`-client.json` config, on top of the explicit `CLIENT_OWNED_FILES`
+/// list — NeoForge's convention for a mod's client-side config half (rendering/UI/tooltip
+/// preferences), as opposed to its `-common.toml` half which stays pack-forced.
+fn is_client_owned(rel_path: &str) -> bool {
+    if CLIENT_OWNED_FILES.contains(&rel_path) {
+        return true;
+    }
+    let Some(file_name) = Path::new(rel_path).file_name().and_then(|f| f.to_str()) else {
+        return false;
+    };
+    file_name.ends_with("-client.toml") || file_name.ends_with("-client.json")
+}
 
 /// (rel_path, dotted key) pairs that stay pack-forced (applied every sync, overwriting whatever
 /// the client has) even inside a `CLIENT_OWNED_FILES` file — carve-outs for the rare key in an
@@ -252,7 +268,7 @@ pub fn apply_all(config_dir_root: &Path, patch: &ConfigMap) -> anyhow::Result<()
         let Some(kind) = file_kind(rel_path) else { continue };
 
         let owned_keys;
-        let keys = if CLIENT_OWNED_FILES.contains(&rel_path.as_str()) {
+        let keys = if is_client_owned(rel_path) {
             let text = fs::read_to_string(&path).unwrap_or_default();
             let current = match kind {
                 FileKind::Toml => extract_toml(&text),
