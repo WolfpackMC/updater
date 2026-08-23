@@ -1,3 +1,4 @@
+use aws_sdk_cloudfront::types::{InvalidationBatch, Paths};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
@@ -13,6 +14,7 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BUCKET: &str = "wolfpackmc";
 const CDN_URL: &str = "https://wolfpack-cdn.kalkafox.dev";
@@ -703,6 +705,43 @@ async fn upload_version(client: &Client, prefix: &str, version: u32) -> anyhow::
     put_object_text(client, &format!("{}/version", prefix), version.to_string(), "text/plain").await
 }
 
+/* ---------------- CLOUDFRONT ---------------- */
+
+/// Only mutable keys need invalidating — content-addressed blobs (mods/{hash}.jar, ...) never
+/// change under the same key, so their long `IMMUTABLE_CACHE_CONTROL` TTL is safe to just expire
+/// naturally. `paths` are absolute (leading-slash) S3 keys, e.g. `/wfp/client/version`.
+async fn invalidate_cloudfront(
+    client: &aws_sdk_cloudfront::Client,
+    distribution_id: &str,
+    paths: &[String],
+) -> anyhow::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let caller_reference = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos().to_string();
+
+    client
+        .create_invalidation()
+        .distribution_id(distribution_id)
+        .invalidation_batch(
+            InvalidationBatch::builder()
+                .paths(
+                    Paths::builder()
+                        .quantity(paths.len() as i32)
+                        .set_items(Some(paths.to_vec()))
+                        .build()?,
+                )
+                .caller_reference(caller_reference)
+                .build()?,
+        )
+        .send()
+        .await?;
+
+    println!("CloudFront invalidation requested for {} path(s)", paths.len());
+    Ok(())
+}
+
 /* ---------------- NEOFORGE ---------------- */
 
 fn get_local_neoforge_version(paths: &ModpackPaths) -> anyhow::Result<String> {
@@ -806,6 +845,21 @@ async fn main() -> anyhow::Result<()> {
         .build();
 
     let client = Client::from_conf(config);
+
+    let cloudfront_distribution_id = env::var("CLOUDFRONT_DISTRIBUTION_ID").ok();
+    let cloudfront_credentials = Credentials::new(
+        env::var("AWS_ACCESS_ID").unwrap_or_default(),
+        env::var("AWS_ACCESS_SECRET").unwrap_or_default(),
+        None,
+        None,
+        "static",
+    );
+    let cloudfront_config = aws_sdk_cloudfront::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .credentials_provider(cloudfront_credentials)
+        .build();
+    let cloudfront_client = aws_sdk_cloudfront::Client::from_conf(cloudfront_config);
 
     println!("Scanning mods...");
     let mods = collect_mods(&paths, server);
@@ -1054,6 +1108,43 @@ async fn main() -> anyhow::Result<()> {
         update_packs_manifest(&client, &modpack, &mrpack_url).await?;
 
         println!("mrpack published: {}", mrpack_url);
+    }
+
+    let mut invalidation_paths: Vec<String> = vec![format!("/{}/version", prefix)];
+    if mods_changed {
+        invalidation_paths.push(format!("/{}/manifest.json", prefix));
+    }
+    if resourcepacks_changed {
+        invalidation_paths.push(format!("/{}/resourcepacks-manifest.json", prefix));
+    }
+    if resourcepack_order_changed {
+        invalidation_paths.push(format!("/{}/resourcepacks-order.json", prefix));
+    }
+    if ftbquests_changed {
+        invalidation_paths.push(format!("/{}/ftbquests-manifest.json", prefix));
+    }
+    if neoforge_changed {
+        invalidation_paths.push(format!("/{}/neoforge-version", prefix));
+    }
+    if launch_settings_changed {
+        invalidation_paths.push(format!("/{}/launch-settings.json", prefix));
+    }
+    if config_changed {
+        invalidation_paths.push(format!("/{}/config-patch.json", prefix));
+    }
+    if !server {
+        invalidation_paths.push(format!("/{}/{}.mrpack", modpack, modpack.to_uppercase()));
+        invalidation_paths.push("/packs.json".to_string());
+    }
+
+    match cloudfront_distribution_id {
+        Some(distribution_id) => {
+            println!("Invalidating CloudFront cache...");
+            invalidate_cloudfront(&cloudfront_client, &distribution_id, &invalidation_paths).await?;
+        }
+        None => println!(
+            "CLOUDFRONT_DISTRIBUTION_ID not set, skipping cache invalidation."
+        ),
     }
 
     Ok(())
