@@ -232,16 +232,25 @@ const CLIENT_OWNED_FILES: &[&str] = &[
     "config/iris-excluded.json",
     "config/cpm.json",
     "config/moreculling.toml",
-    "config/xaero/minimap/client.cfg",
-    "config/xaero/world-map/client.cfg",
-    "config/xaero/minimap/default_radar_categories_client.json",
 ];
 
+/// `rel_path` prefixes whose every file is client-owned (same "set only if absent" rule as
+/// `CLIENT_OWNED_FILES`). Xaero's Minimap/World Map keep their entire config tree here: the
+/// `client.cfg`s, the radar-category lists (both the `_client` and `_server` variants — "server"
+/// there means "categories used while on a server", still a per-player display preference), and
+/// the per-profile files under `profiles/`. All of it is UI/rendering state the mod rewrites as
+/// the player toggles things in-game, so the pack should only ever seed what's genuinely missing.
+const CLIENT_OWNED_PREFIXES: &[&str] = &["config/xaero/"];
+
 /// True for any `-client.toml`/`-client.json` config, on top of the explicit `CLIENT_OWNED_FILES`
-/// list — NeoForge's convention for a mod's client-side config half (rendering/UI/tooltip
-/// preferences), as opposed to its `-common.toml` half which stays pack-forced.
+/// list and the `CLIENT_OWNED_PREFIXES` subtrees — NeoForge's convention for a mod's client-side
+/// config half (rendering/UI/tooltip preferences), as opposed to its `-common.toml` half which
+/// stays pack-forced.
 fn is_client_owned(rel_path: &str) -> bool {
     if CLIENT_OWNED_FILES.contains(&rel_path) {
+        return true;
+    }
+    if CLIENT_OWNED_PREFIXES.iter().any(|p| rel_path.starts_with(p)) {
         return true;
     }
     let Some(file_name) = Path::new(rel_path).file_name().and_then(|f| f.to_str()) else {
