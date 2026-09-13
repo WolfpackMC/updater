@@ -401,6 +401,7 @@ fn sync_resourcepacks(
     // here itself, tracked via a local state file — anything else (player's own packs,
     // mod-injected packs) is left alone regardless of whether it's in the current manifest.
     let resourcepack_state_path = Path::new(inst_mc_dir).join(".wolfpacker_resourcepacks.json");
+    let is_first_sync = !resourcepack_state_path.exists();
     let previously_managed: Vec<String> = fs::read_to_string(&resourcepack_state_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -456,25 +457,30 @@ fn sync_resourcepacks(
     let added_resourcepacks: Vec<String> =
         resourcepack_manifest.iter().map(|e| e.name.clone()).collect();
 
-    // Optional: the pack maintainer's declared load order for managed resourcepacks (from the
-    // source instance's own options.txt). Absent/404 just means no order data was published —
-    // skip reordering and leave whatever order the player already has.
-    let order: Vec<String> = client
-        .get(format!("{}/{}/resourcepacks-order.json", CDN_URL, prefix))
-        .send()
-        .ok()
-        .filter(|res| res.status().is_success())
-        .and_then(|res| res.json().ok())
-        .unwrap_or_default();
+    // Only touch options.txt's resourcePacks list on the very first sync (no state file yet).
+    // After that, players are free to enable/disable/reorder packs themselves without wolfpacker
+    // re-forcing them on every launch — the pack files themselves still stay up to date above.
+    if is_first_sync {
+        // Optional: the pack maintainer's declared load order for managed resourcepacks (from the
+        // source instance's own options.txt). Absent/404 just means no order data was published —
+        // skip reordering and leave whatever order the player already has.
+        let order: Vec<String> = client
+            .get(format!("{}/{}/resourcepacks-order.json", CDN_URL, prefix))
+            .send()
+            .ok()
+            .filter(|res| res.status().is_success())
+            .and_then(|res| res.json().ok())
+            .unwrap_or_default();
 
-    // Merge (not overwrite) the enable/disable change into options.txt's resourcePacks list
-    // so a player's own entries and anything other mods register there survive untouched.
-    wolfpacker::config_patch::merge_resource_pack_entries(
-        &Path::new(inst_mc_dir).join("options.txt"),
-        &added_resourcepacks,
-        &removed_resourcepacks,
-        &order,
-    )?;
+        // Merge (not overwrite) the enable/disable change into options.txt's resourcePacks list
+        // so a player's own entries and anything other mods register there survive untouched.
+        wolfpacker::config_patch::merge_resource_pack_entries(
+            &Path::new(inst_mc_dir).join("options.txt"),
+            &added_resourcepacks,
+            &removed_resourcepacks,
+            &order,
+        )?;
+    }
 
     let managed_state: Vec<&str> = resourcepack_manifest.iter().map(|p| p.name.as_str()).collect();
     fs::write(&resourcepack_state_path, serde_json::to_string(&managed_state)?)?;
