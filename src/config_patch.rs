@@ -743,3 +743,61 @@ pub fn merge_resource_pack_entries(
     fs::write(options_path, lines.join("\n") + "\n")?;
     Ok(())
 }
+
+/// Appends each of `ids` (raw pack ids as they appear in options.txt, e.g. `continuity:default`
+/// — not `file/` names) to the `resourcePacks` list if it isn't already there. Unlike
+/// `merge_resource_pack_entries`, callers run this on every launch, so a pack the player disabled
+/// gets switched back on. Only ever adds; every other entry and the existing order stay untouched.
+/// Returns whether options.txt was changed.
+pub fn ensure_resource_packs_enabled(options_path: &Path, ids: &[&str]) -> anyhow::Result<bool> {
+    let text = fs::read_to_string(options_path).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+
+    let mut packs: Vec<String> = lines
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("resourcePacks:"))
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_default();
+
+    let missing: Vec<&str> = ids.iter().copied().filter(|id| !packs.iter().any(|p| p == id)).collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    packs.extend(missing.into_iter().map(|id| id.to_string()));
+
+    let new_line = format!("resourcePacks:{}", serde_json::to_string(&packs)?);
+    match lines.iter_mut().find(|l| l.trim().starts_with("resourcePacks:")) {
+        Some(line) => *line = new_line,
+        None => lines.push(new_line),
+    }
+
+    if let Some(parent) = options_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(options_path, lines.join("\n") + "\n")?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_resource_packs_enabled_adds_only_missing_ids() {
+        let dir = std::env::temp_dir().join(format!("wolfpacker-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("options.txt");
+        fs::write(&path, "fov:0.0\nresourcePacks:[\"vanilla\",\"continuity:default\"]\nlang:en_us\n").unwrap();
+
+        let ids = ["continuity:default", "continuity:glass_pane_culling_fix"];
+        assert!(ensure_resource_packs_enabled(&path, &ids).unwrap());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "fov:0.0\nresourcePacks:[\"vanilla\",\"continuity:default\",\"continuity:glass_pane_culling_fix\"]\nlang:en_us\n"
+        );
+        // already enabled: no rewrite
+        assert!(!ensure_resource_packs_enabled(&path, &ids).unwrap());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}

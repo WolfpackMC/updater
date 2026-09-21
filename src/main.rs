@@ -9,6 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CDN_URL: &str = "https://wolfpackmc.s3.us-east-1.amazonaws.com";
 
+/// Built-in (mod-registered) resourcepacks kept enabled on every client launch, even if the
+/// player turned them off: Continuity's default connected textures and its glass pane culling fix.
+const FORCED_RESOURCE_PACK_IDS: &[&str] = &["continuity:default", "continuity:glass_pane_culling_fix"];
+
 #[derive(serde::Deserialize)]
 struct ModEntry {
     name: String,
@@ -602,6 +606,15 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or(cwd);
+
+    // Runs before the version check so it applies on every launch, not just on updates —
+    // a player disabling these packs gets them switched back on next time they launch.
+    if !server {
+        let options_path = Path::new(&inst_mc_dir).join("options.txt");
+        if wolfpacker::config_patch::ensure_resource_packs_enabled(&options_path, FORCED_RESOURCE_PACK_IDS)? {
+            println!("Re-enabled required resourcepacks: {:?}", FORCED_RESOURCE_PACK_IDS);
+        }
+    }
 
     let version_path = Path::new(&inst_dir).join("version");
     let profile_path = Path::new(&inst_dir).join("profile");
